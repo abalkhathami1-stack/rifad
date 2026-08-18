@@ -1,7 +1,13 @@
 const request = require('supertest');
-const argon2 = require('argon2');
 const app = require('../src/app');
 const prisma = require('../src/config/prisma');
+const {
+  captureRealPlatformOwnerBaseline,
+  createEphemeralPlatformOwner,
+  loginEphemeralPlatformOwner,
+  cleanupEphemeralPlatformOwner,
+  verifyRealPlatformOwnerZeroTouch
+} = require('./helpers/ephemeral_owner');
 
 async function runStudentOnboardingApiTestSuite() {
   console.log('🧪 ========================================================');
@@ -24,56 +30,19 @@ async function runStudentOnboardingApiTestSuite() {
 
   const createdSchoolIds = [];
   const createdUserIds = [];
-
-  // Capture baseline of real platform.owner to guarantee zero-touch verification
-  const realOwnerBaseline = await prisma.user.findFirst({
-    where: { username: 'platform.owner' },
-    select: { id: true, passwordHash: true, status: true }
-  });
+  let ephemeralOwner = null;
 
   try {
+    const baseline = await captureRealPlatformOwnerBaseline(prisma);
+
     // ----------------------------------------------------
     // SETUP: Ephemeral Platform Owner Creation & Login
     // ----------------------------------------------------
     console.log('--- SETUP: Ephemeral Platform Owner Creation & Authentication ---');
-    const platformOwnerRole = await prisma.role.findFirst({ where: { code: 'PLATFORM_OWNER' } });
-    if (!platformOwnerRole) {
-      throw new Error('PLATFORM_OWNER role not found in database');
-    }
+    ephemeralOwner = await createEphemeralPlatformOwner(prisma);
+    const { cookie: ownerCookie } = await loginEphemeralPlatformOwner(request, app, ephemeralOwner);
 
-    const ephemeralOwnerUsername = `test.ephemeral.owner.${Date.now()}`;
-    const ephemeralOwnerPassword = `TestPass_${Date.now()}!EphemeralOwner2026`;
-    const ephemeralHash = await argon2.hash(ephemeralOwnerPassword, {
-      type: argon2.argon2id,
-      memoryCost: 65536,
-      timeCost: 3,
-      parallelism: 4
-    });
-
-    const ephemeralOwner = await prisma.user.create({
-      data: {
-        username: ephemeralOwnerUsername,
-        passwordHash: ephemeralHash,
-        fullName: 'مالك منصة تجريبي مؤقت',
-        status: 'ACTIVE'
-      }
-    });
-    createdUserIds.push(ephemeralOwner.id);
-
-    await prisma.userRoleAssignment.create({
-      data: {
-        userId: ephemeralOwner.id,
-        roleId: platformOwnerRole.id,
-        scopeType: 'PLATFORM'
-      }
-    });
-
-    const ownerLoginRes = await request(app)
-      .post('/api/v1/auth/login')
-      .send({ username: ephemeralOwnerUsername, password: ephemeralOwnerPassword });
-
-    assert(ownerLoginRes.status === 200, 'Setup: Ephemeral Platform Owner authenticated (200 OK)');
-    const ownerCookie = ownerLoginRes.headers['set-cookie'].find(c => c.startsWith('rifad_session=')).split(';')[0];
+    assert(Boolean(ownerCookie), 'Setup: Ephemeral Platform Owner authenticated (200 OK)');
 
     // ----------------------------------------------------
     // SETUP: Create Two Isolated Schools (A & B)
@@ -380,17 +349,7 @@ async function runStudentOnboardingApiTestSuite() {
     // SCENARIO J: Real Platform Owner Zero-Touch Verification
     // ==================================================================
     console.log('\n--- SCENARIO J: Real Platform Owner Zero-Touch Verification ---');
-    const realOwnerCurrent = await prisma.user.findFirst({
-      where: { username: 'platform.owner' },
-      select: { id: true, passwordHash: true, status: true }
-    });
-    const realOwnerActiveSessions = await prisma.userSession.count({
-      where: { userId: realOwnerBaseline.id, isRevoked: false, expiresAt: { gt: new Date() } }
-    });
-
-    assert(realOwnerCurrent.passwordHash === realOwnerBaseline.passwordHash, 'Scenario J: platform.owner passwordHash was NOT touched or modified');
-    assert(realOwnerActiveSessions === 0, 'Scenario J: 0 active sessions created for platform.owner');
-    assert(realOwnerCurrent.status === 'ACTIVE', 'Scenario J: platform.owner status remains ACTIVE');
+    await verifyRealPlatformOwnerZeroTouch(prisma, baseline, assert);
 
     console.log('\n========================================================');
     console.log(`🎉 ALL ${passedTests}/${totalTests} ONBOARDING COMMIT API TESTS PASSED (100%)!`);
@@ -428,6 +387,8 @@ async function runStudentOnboardingApiTestSuite() {
         await prisma.auditLog.deleteMany({ where: { schoolId: sid } });
         await prisma.school.deleteMany({ where: { id: sid } });
       }
+
+      await cleanupEphemeralPlatformOwner(prisma, ephemeralOwner);
       console.log('✨ Cleanup complete.');
     } catch (cleanupErr) {
       console.error('⚠️ Cleanup warning:', cleanupErr.message);

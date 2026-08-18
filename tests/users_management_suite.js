@@ -1,7 +1,13 @@
 const request = require('supertest');
-const argon2 = require('argon2');
 const app = require('../src/app');
 const prisma = require('../src/config/prisma');
+const {
+  captureRealPlatformOwnerBaseline,
+  createEphemeralPlatformOwner,
+  loginEphemeralPlatformOwner,
+  cleanupEphemeralPlatformOwner,
+  verifyRealPlatformOwnerZeroTouch
+} = require('./helpers/ephemeral_owner');
 
 async function runUsersTestSuite() {
   console.log('🧪 ========================================================');
@@ -24,32 +30,19 @@ async function runUsersTestSuite() {
 
   const createdUserIds = [];
   const createdSchoolIds = [];
+  let ephemeralOwner = null;
 
   try {
+    const baseline = await captureRealPlatformOwnerBaseline(prisma);
+
     // ----------------------------------------------------
-    // SETUP: Ensure Platform Owner has known test password
+    // SETUP: Ephemeral Platform Owner Login
     // ----------------------------------------------------
-    const ownerPassword = 'OwnerTestPassword2026!';
-    const ownerHash = await argon2.hash(ownerPassword, {
-      type: argon2.argon2id,
-      memoryCost: 65536,
-      timeCost: 3,
-      parallelism: 4
-    });
+    console.log('--- 1. Authenticate as Ephemeral PLATFORM_OWNER ---');
+    ephemeralOwner = await createEphemeralPlatformOwner(prisma);
+    const { cookie: ownerCookie } = await loginEphemeralPlatformOwner(request, app, ephemeralOwner);
 
-    await prisma.user.updateMany({
-      where: { username: 'platform.owner' },
-      data: { passwordHash: ownerHash, failedLoginAttempts: 0, lockedUntil: null, status: 'ACTIVE' }
-    });
-
-    // 1. Authenticate as PLATFORM_OWNER
-    console.log('--- 1. Authenticate as PLATFORM_OWNER ---');
-    const ownerLoginRes = await request(app)
-      .post('/api/v1/auth/login')
-      .send({ username: 'platform.owner', password: ownerPassword });
-
-    assert(ownerLoginRes.status === 200, 'Platform Owner logs in successfully');
-    const ownerCookie = ownerLoginRes.headers['set-cookie'].find(c => c.startsWith('rifad_session=')).split(';')[0];
+    assert(Boolean(ownerCookie), 'Platform Owner logs in successfully');
 
     // 2. Setup Temporary Test School
     console.log('\n--- 2. Create Temporary Test School for Scope Testing ---');
@@ -140,9 +133,8 @@ async function runUsersTestSuite() {
 
     // 8. School Admin Multi-Tenancy Scope: Cannot view PLATFORM_OWNER details
     console.log('\n--- 8. Multi-Tenancy Scope Isolation (School Admin -> Platform Owner View) ---');
-    const ownerUser = await prisma.user.findFirst({ where: { username: 'platform.owner' } });
     const viewOwnerRes = await request(app)
-      .get(`/api/v1/users/${ownerUser.id}`)
+      .get(`/api/v1/users/${ephemeralOwner.id}`)
       .set('Cookie', adminCookie);
 
     assert(viewOwnerRes.status === 403, 'School Admin forbidden from accessing Platform Owner details (403)');
@@ -230,6 +222,9 @@ async function runUsersTestSuite() {
     assert(userAuditLogs.length >= 5, 'All user lifecycle operations recorded in audit_logs');
     console.log(`  - Verified ${userAuditLogs.length} audit logs covering user management operations.`);
 
+    console.log('\n--- 14. Real Platform Owner Zero-Touch Verification ---');
+    await verifyRealPlatformOwnerZeroTouch(prisma, baseline, assert);
+
     console.log('\n========================================================');
     console.log(`🎉 ALL ${passedTests}/${totalTests} USER MANAGEMENT TESTS PASSED (100%)!`);
     console.log('========================================================\n');
@@ -239,17 +234,21 @@ async function runUsersTestSuite() {
   } finally {
     // Cleanup temporary test data
     console.log('🧹 Cleaning up temporary test users and schools...');
-    for (const uid of createdUserIds) {
-      await prisma.userSession.deleteMany({ where: { userId: uid } });
-      await prisma.userRoleAssignment.deleteMany({ where: { userId: uid } });
-      await prisma.auditLog.deleteMany({ where: { entityId: uid } });
-      await prisma.user.deleteMany({ where: { id: uid } });
+    try {
+      for (const uid of createdUserIds) {
+        await prisma.userSession.deleteMany({ where: { userId: uid } });
+        await prisma.userRoleAssignment.deleteMany({ where: { userId: uid } });
+        await prisma.auditLog.deleteMany({ where: { entityId: uid } });
+        await prisma.user.deleteMany({ where: { id: uid } });
+      }
+      for (const sid of createdSchoolIds) {
+        await prisma.school.deleteMany({ where: { id: sid } });
+      }
+      await cleanupEphemeralPlatformOwner(prisma, ephemeralOwner);
+      console.log('✨ Cleanup complete.');
+    } catch (cleanupErr) {
+      console.error('⚠️ Cleanup warning:', cleanupErr.message);
     }
-    for (const sid of createdSchoolIds) {
-      await prisma.school.deleteMany({ where: { id: sid } });
-    }
-    console.log('✨ Cleanup complete.');
-    await prisma.$disconnect();
   }
 }
 

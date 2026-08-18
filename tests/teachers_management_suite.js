@@ -1,7 +1,13 @@
 const request = require('supertest');
-const argon2 = require('argon2');
 const app = require('../src/app');
 const prisma = require('../src/config/prisma');
+const {
+  captureRealPlatformOwnerBaseline,
+  createEphemeralPlatformOwner,
+  loginEphemeralPlatformOwner,
+  cleanupEphemeralPlatformOwner,
+  verifyRealPlatformOwnerZeroTouch
+} = require('./helpers/ephemeral_owner');
 
 async function runTeachersTestSuite() {
   console.log('🧪 ========================================================');
@@ -24,31 +30,19 @@ async function runTeachersTestSuite() {
 
   const createdSchoolIds = [];
   const createdUserIds = [];
+  let ephemeralOwner = null;
 
   try {
+    const baseline = await captureRealPlatformOwnerBaseline(prisma);
+
     // ----------------------------------------------------
-    // SETUP: Platform Owner Login
+    // SETUP: Ephemeral Platform Owner Login
     // ----------------------------------------------------
-    const ownerPassword = 'OwnerTestPassword2026!';
-    const ownerHash = await argon2.hash(ownerPassword, {
-      type: argon2.argon2id,
-      memoryCost: 65536,
-      timeCost: 3,
-      parallelism: 4
-    });
+    console.log('--- 1. Authenticate as Ephemeral PLATFORM_OWNER ---');
+    ephemeralOwner = await createEphemeralPlatformOwner(prisma);
+    const { cookie: ownerCookie } = await loginEphemeralPlatformOwner(request, app, ephemeralOwner);
 
-    await prisma.user.updateMany({
-      where: { username: 'platform.owner' },
-      data: { passwordHash: ownerHash, failedLoginAttempts: 0, lockedUntil: null, status: 'ACTIVE' }
-    });
-
-    console.log('--- 1. Authenticate as PLATFORM_OWNER ---');
-    const ownerLoginRes = await request(app)
-      .post('/api/v1/auth/login')
-      .send({ username: 'platform.owner', password: ownerPassword });
-
-    assert(ownerLoginRes.status === 200, 'Platform Owner authenticated (200 OK)');
-    const ownerCookie = ownerLoginRes.headers['set-cookie'].find(c => c.startsWith('rifad_session=')).split(';')[0];
+    assert(Boolean(ownerCookie), 'Platform Owner authenticated (200 OK)');
 
     // ----------------------------------------------------
     // SETUP: Create Two Isolated Schools
@@ -202,7 +196,7 @@ async function runTeachersTestSuite() {
     assert(crossSchoolTchRes.body.error.code === 'FORBIDDEN_SCOPE_VIOLATION', 'Returns FORBIDDEN_SCOPE_VIOLATION');
 
     // ----------------------------------------------------
-    // TEST: PII Masking Protection
+    // TEST: PII Masking Protection for Teachers
     // ----------------------------------------------------
     console.log('\n--- 8. PII Masking Protection for Teachers ---');
     // Regular teacher user without view_sensitive permission
@@ -210,7 +204,7 @@ async function runTeachersTestSuite() {
       data: {
         username: `guest.tch.${Date.now()}`,
         fullName: 'مستخدم عادي',
-        passwordHash: ownerHash,
+        passwordHash: ephemeralOwner.passwordHash,
         status: 'ACTIVE'
       }
     });
@@ -228,7 +222,7 @@ async function runTeachersTestSuite() {
 
     const testUserLoginRes = await request(app)
       .post('/api/v1/auth/login')
-      .send({ username: testUser.username, password: ownerPassword });
+      .send({ username: testUser.username, password: ephemeralOwner.password });
     const testUserCookie = testUserLoginRes.headers['set-cookie'].find(c => c.startsWith('rifad_session=')).split(';')[0];
 
     const guestViewTchRes = await request(app)
@@ -319,6 +313,9 @@ async function runTeachersTestSuite() {
     assert(teacherAuditLogs.length >= 4, 'All 4 teacher operations recorded in audit_logs');
     console.log(`  - Verified ${teacherAuditLogs.length} teacher audit logs created for School A.`);
 
+    console.log('\n--- 13. Real Platform Owner Zero-Touch Verification ---');
+    await verifyRealPlatformOwnerZeroTouch(prisma, baseline, assert);
+
     console.log('\n========================================================');
     console.log(`🎉 ALL ${passedTests}/${totalTests} TEACHERS DOMAIN TESTS PASSED (100%)!`);
     console.log('========================================================\n');
@@ -327,29 +324,33 @@ async function runTeachersTestSuite() {
     throw error;
   } finally {
     console.log('🧹 Cleaning up temporary test teacher data and schools...');
-    await prisma.teacherAssignment.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
-    await prisma.teacherSubject.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
-    await prisma.teacher.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
-    await prisma.specialization.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
-    await prisma.subject.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
-    await prisma.classSection.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
-    await prisma.grade.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
-    await prisma.educationalStage.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
-    await prisma.academicYear.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
-    await prisma.schoolSection.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
+    try {
+      await prisma.teacherAssignment.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
+      await prisma.teacherSubject.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
+      await prisma.teacher.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
+      await prisma.specialization.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
+      await prisma.subject.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
+      await prisma.classSection.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
+      await prisma.grade.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
+      await prisma.educationalStage.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
+      await prisma.academicYear.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
+      await prisma.schoolSection.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
 
-    for (const uid of createdUserIds) {
-      await prisma.userSession.deleteMany({ where: { userId: uid } });
-      await prisma.userRoleAssignment.deleteMany({ where: { userId: uid } });
-      await prisma.auditLog.deleteMany({ where: { entityId: uid } });
-      await prisma.user.deleteMany({ where: { id: uid } });
+      for (const uid of createdUserIds) {
+        await prisma.userSession.deleteMany({ where: { userId: uid } });
+        await prisma.userRoleAssignment.deleteMany({ where: { userId: uid } });
+        await prisma.auditLog.deleteMany({ where: { entityId: uid } });
+        await prisma.user.deleteMany({ where: { id: uid } });
+      }
+      for (const sid of createdSchoolIds) {
+        await prisma.auditLog.deleteMany({ where: { schoolId: sid } });
+        await prisma.school.deleteMany({ where: { id: sid } });
+      }
+      await cleanupEphemeralPlatformOwner(prisma, ephemeralOwner);
+      console.log('✨ Cleanup complete.');
+    } catch (cleanupErr) {
+      console.error('⚠️ Cleanup warning:', cleanupErr.message);
     }
-    for (const sid of createdSchoolIds) {
-      await prisma.auditLog.deleteMany({ where: { schoolId: sid } });
-      await prisma.school.deleteMany({ where: { id: sid } });
-    }
-    console.log('✨ Cleanup complete.');
-    await prisma.$disconnect();
   }
 }
 

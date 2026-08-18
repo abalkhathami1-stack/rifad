@@ -1,10 +1,16 @@
 const request = require('supertest');
 const app = require('../src/app');
 const prisma = require('../src/config/prisma');
+const {
+  captureRealPlatformOwnerBaseline,
+  createEphemeralPlatformOwner,
+  cleanupEphemeralPlatformOwner,
+  verifyRealPlatformOwnerZeroTouch
+} = require('./helpers/ephemeral_owner');
 
 async function runTestSuite() {
   console.log('🧪 ========================================================');
-  console.log('🧪 RUNNING BACKEND FOUNDATION: AUTH & RBAC TEST SUITE');
+  console.log('🧪 RUNNING BACKEND FOUNDATION: AUTH & RBAC TEST SUITE (ISOLATED)');
   console.log('🧪 ========================================================\n');
 
   let passedTests = 0;
@@ -21,7 +27,14 @@ async function runTestSuite() {
     }
   }
 
+  let ephemeralOwner = null;
+
   try {
+    const baseline = await captureRealPlatformOwnerBaseline(prisma);
+
+    // Setup Ephemeral Owner
+    ephemeralOwner = await createEphemeralPlatformOwner(prisma);
+
     // Test 1: Health Check Endpoint
     console.log('--- 1. API Health Check ---');
     const healthRes = await request(app).get('/api/v1/health');
@@ -39,40 +52,26 @@ async function runTestSuite() {
     console.log('\n--- 3. Failed Login Handling & Security Logging ---');
     const failedLoginRes = await request(app)
       .post('/api/v1/auth/login')
-      .send({ username: 'platform.owner', password: 'WrongPassword123!' });
+      .send({ username: ephemeralOwner.username, password: 'WrongPassword123!' });
 
     assert(failedLoginRes.status === 401, 'Login with wrong password returns 401');
     assert(failedLoginRes.body.error.code === 'AUTH_INVALID_CREDENTIALS', 'Returns AUTH_INVALID_CREDENTIALS');
 
     const recentFailedAttempt = await prisma.loginAttempt.findFirst({
-      where: { username: 'platform.owner', isSuccess: false },
+      where: { username: ephemeralOwner.username, isSuccess: false },
       orderBy: { createdAt: 'desc' }
     });
     assert(Boolean(recentFailedAttempt), 'Failed login attempt recorded in login_attempts');
 
     // Test 4: Successful Login & HttpOnly Cookie Issuance
     console.log('\n--- 4. Successful Authentication & Session Setup ---');
-    const argon2 = require('argon2');
-    const testPassword = 'SecureOwnerTestPass2026!';
-    const testHash = await argon2.hash(testPassword, {
-      type: argon2.argon2id,
-      memoryCost: 65536,
-      timeCost: 3,
-      parallelism: 4
-    });
-
-    await prisma.user.updateMany({
-      where: { username: 'platform.owner' },
-      data: { passwordHash: testHash, failedLoginAttempts: 0, lockedUntil: null }
-    });
-
     const loginRes = await request(app)
       .post('/api/v1/auth/login')
-      .send({ username: 'platform.owner', password: testPassword });
+      .send({ username: ephemeralOwner.username, password: ephemeralOwner.password });
 
     assert(loginRes.status === 200, 'Login with correct credentials returns 200 OK');
     assert(loginRes.body.success === true, 'Login response has success=true');
-    assert(loginRes.body.data.user.username === 'platform.owner', 'Returns platform.owner profile');
+    assert(loginRes.body.data.user.username === ephemeralOwner.username, 'Returns ephemeral platform owner profile');
     assert(loginRes.body.data.roles.includes('PLATFORM_OWNER'), 'Includes PLATFORM_OWNER role');
     assert(loginRes.body.data.permissions.length >= 34, 'Loads baseline permissions (including newly added module permissions)');
 
@@ -93,7 +92,7 @@ async function runTestSuite() {
       .set('Cookie', cookieString);
 
     assert(meRes.status === 200, '/auth/me returns 200 with valid session cookie');
-    assert(meRes.body.data.user.username === 'platform.owner', 'Returns matching username');
+    assert(meRes.body.data.user.username === ephemeralOwner.username, 'Returns matching username');
     assert(meRes.body.data.isPlatformLevel === true, 'Identifies platform level scope');
 
     // Test 6: RBAC Permission Guard (Authorized Permission)
@@ -148,6 +147,10 @@ async function runTestSuite() {
     assert(latestAuditLogs.length >= 3, 'Audit logs contain LOGIN_SUCCESS, LOGIN_FAILED, and LOGOUT records');
     console.log(`  - Verified ${latestAuditLogs.length} recent audit event records.`);
 
+    // Test 12: Zero-Touch Real Platform Owner Verification
+    console.log('\n--- 12. Real Platform Owner Zero-Touch Verification ---');
+    await verifyRealPlatformOwnerZeroTouch(prisma, baseline, assert);
+
     console.log('\n========================================================');
     console.log(`🎉 ALL ${passedTests}/${totalTests} TESTS PASSED WITH 100% SUCCESS!`);
     console.log('========================================================\n');
@@ -155,7 +158,7 @@ async function runTestSuite() {
     console.error('❌ Test Suite Failed:', error);
     process.exit(1);
   } finally {
-    await prisma.$disconnect();
+    await cleanupEphemeralPlatformOwner(prisma, ephemeralOwner);
   }
 }
 
