@@ -853,49 +853,109 @@ class ImportService {
     isPlatformLevel,
     context = {}
   }) {
-    const batch = await prisma.importBatch.findUnique({
-      where: { id: batchId },
-      include: {
-        records: {
-          where: { status: 'VALID' },
-          orderBy: { rowNumber: 'asc' }
-        }
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. PostgreSQL Row-level lock on the targeted import batch to prevent concurrent commits
+      const lockedBatches = await tx.$queryRaw`
+        SELECT 
+          id, 
+          school_id AS "schoolId", 
+          status, 
+          error_rows AS "errorRows", 
+          valid_rows AS "validRows", 
+          total_rows AS "totalRows",
+          entity_type AS "entityType"
+        FROM import_batches
+        WHERE id = ${batchId}::uuid
+        FOR UPDATE
+      `;
+
+      const batch = lockedBatches && lockedBatches.length > 0 ? lockedBatches[0] : null;
+
+      if (!batch) {
+        throw new AppError('دفعة الاستيراد غير موجودة', 404, ERROR_CODES.NOT_FOUND);
       }
-    });
 
-    if (!batch) {
-      throw new AppError('دفعة الاستيراد غير موجودة', 404, ERROR_CODES.NOT_FOUND);
-    }
+      const schoolId = AcademicService.resolveSchoolId({
+        callerScopes,
+        isPlatformLevel,
+        requestedSchoolId: batch.schoolId
+      });
 
-    const schoolId = AcademicService.resolveSchoolId({
-      callerScopes,
-      isPlatformLevel,
-      requestedSchoolId: batch.schoolId
-    });
+      if (batch.status === 'COMMITTED') {
+        throw new AppError('تم اعتماد هذه الدفعة مسبقاً ولا يمكن إعادة إدخالها', 409, ERROR_CODES.CONFLICT);
+      }
 
-    if (batch.status === 'COMMITTED') {
-      throw new AppError('تم اعتماد هذه الدفعة مسبقاً ولا يمكن إعادة إدخالها', 400, ERROR_CODES.BAD_REQUEST);
-    }
+      if (batch.status !== 'VALIDATED') {
+        throw new AppError(`لا يمكن اعتماد الدفعة: حالة الدفعة الحالية هي ${batch.status} وليست VALIDATED`, 409, ERROR_CODES.CONFLICT);
+      }
 
-    if (batch.status !== 'VALIDATED' || batch.errorRows > 0 || batch.records.length === 0) {
-      throw new AppError('لا يمكن اعتماد الدفعة إلا بعد فحصها واجتياز كافة السجلات بنجاح (VALIDATED مع صفر أخطاء)', 400, ERROR_CODES.BAD_REQUEST);
-    }
+      if (batch.errorRows > 0) {
+        throw new AppError('لا يمكن اعتماد الدفعة: تحتوي الدفعة على أخطاء تحقق يجب تصحيحها أولاً', 400, ERROR_CODES.BAD_REQUEST);
+      }
 
-    // Atomic state lock: VALIDATED -> COMMITTING
-    const lockResult = await prisma.importBatch.updateMany({
-      where: { id: batchId, status: 'VALIDATED' },
-      data: { status: 'COMMITTING' }
-    });
+      // 2. Fetch VALID records belonging to this batch inside the transaction
+      const records = await tx.importRecord.findMany({
+        where: { batchId, status: 'VALID' },
+        orderBy: { rowNumber: 'asc' }
+      });
 
-    if (lockResult.count === 0) {
-      throw new AppError('لا يمكن اعتماد الدفعة: الدفعة قيد المعالجة حالياً أو تم تغيير حالتها', 409, ERROR_CODES.CONFLICT);
-    }
+      if (records.length === 0) {
+        throw new AppError('لا يمكن اعتماد الدفعة: لا توجد سجلات صالحة للاعتماد في هذه الدفعة', 400, ERROR_CODES.BAD_REQUEST);
+      }
 
-    try {
-      // Pre-Transaction In-Memory Data Preparation & Family Grouping
+      // Helper to map and normalize relationship types to standard GuardianRelationshipType enum
+      const normalizeRelationship = (rawRel) => {
+        if (!rawRel) return 'FATHER';
+        const cleaned = String(rawRel).trim().toUpperCase();
+
+        if (
+          cleaned === 'GRANDPARENT' ||
+          cleaned === 'GRANDFATHER' ||
+          cleaned === 'GRANDMOTHER' ||
+          cleaned === 'جد' ||
+          cleaned === 'جدة' ||
+          cleaned === 'الجد' ||
+          cleaned === 'الجدة'
+        ) {
+          return 'GRANDPARENT';
+        }
+
+        if (cleaned === 'FATHER' || cleaned === 'أب' || cleaned === 'والد' || cleaned === 'الوالد' || cleaned === 'الاب') {
+          return 'FATHER';
+        }
+
+        if (cleaned === 'MOTHER' || cleaned === 'أم' || cleaned === 'والدة' || cleaned === 'الوالدة' || cleaned === 'الام') {
+          return 'MOTHER';
+        }
+
+        if (cleaned === 'BROTHER' || cleaned === 'أخ' || cleaned === 'اخ' || cleaned === 'الأخ' || cleaned === 'الاخ') {
+          return 'BROTHER';
+        }
+
+        if (cleaned === 'SISTER' || cleaned === 'أخت' || cleaned === 'اخت' || cleaned === 'الأخت' || cleaned === 'الاخت') {
+          return 'SISTER';
+        }
+
+        if (cleaned === 'UNCLE' || cleaned === 'عم' || cleaned === 'العم' || cleaned === 'خال' || cleaned === 'الخال') {
+          return 'UNCLE';
+        }
+
+        if (cleaned === 'AUNT' || cleaned === 'عمة' || cleaned === 'العمة' || cleaned === 'خالة' || cleaned === 'الخالة') {
+          return 'AUNT';
+        }
+
+        if (cleaned === 'LEGAL_GUARDIAN' || cleaned === 'وصي' || cleaned === 'ولي أمر' || cleaned === 'الوصي' || cleaned === 'ولي الامر' || cleaned === 'كفيل') {
+          return 'LEGAL_GUARDIAN';
+        }
+
+        const validEnumValues = ['FATHER', 'MOTHER', 'LEGAL_GUARDIAN', 'BROTHER', 'SISTER', 'UNCLE', 'AUNT', 'GRANDPARENT', 'OTHER'];
+        return validEnumValues.includes(cleaned) ? cleaned : 'FATHER';
+      };
+
+      // 3. In-Memory Data Preparation & Family Grouping
       const familyMap = new Map();
 
-      for (const record of batch.records) {
+      for (const record of records) {
         const rawData = record.rawData || {};
         const processed = ArabicDataNormalizer.processRow(rawData);
 
@@ -940,9 +1000,8 @@ class ImportService {
 
         const gradeVal = rawData.grade || rawData.grade_name || rawData.gradeId || '';
         const sectionVal = rawData.section || rawData.classSection || rawData.class_section || '';
-        const relationshipTypeRaw = (rawData.relationshipType || rawData.relationship_type || rawData.relationship || 'FATHER').toUpperCase();
-        const validRelTypes = ['FATHER', 'MOTHER', 'BROTHER', 'SISTER', 'UNCLE', 'AUNT', 'GRANDFATHER', 'GRANDMOTHER', 'LEGAL_GUARDIAN', 'OTHER'];
-        const relationshipType = validRelTypes.includes(relationshipTypeRaw) ? relationshipTypeRaw : 'FATHER';
+        const relationshipTypeRaw = rawData.relationshipType || rawData.relationship_type || rawData.relationship || 'FATHER';
+        const relationshipType = normalizeRelationship(relationshipTypeRaw);
 
         familyMap.get(parentNationalIdHash).children.push({
           recordId: record.id,
@@ -966,12 +1025,12 @@ class ImportService {
         });
       }
 
-      // Load Academic Dependencies
-      const activeYear = await prisma.academicYear.findFirst({
+      // 4. Load Academic Dependencies
+      const activeYear = await tx.academicYear.findFirst({
         where: { schoolId, isCurrent: true, deletedAt: null }
       });
 
-      const classes = await prisma.classSection.findMany({
+      const classes = await tx.classSection.findMany({
         where: { schoolId, deletedAt: null }
       });
       const classMap = new Map();
@@ -981,210 +1040,175 @@ class ImportService {
         if (c.nameEn) classMap.set(c.nameEn.trim(), c);
       });
 
-      // Execute Atomic Database Transaction
-      const result = await prisma.$transaction(async (tx) => {
-        let createdStudentsCount = 0;
-        let createdEnrollmentsCount = 0;
-        let resolvedGuardiansCount = 0;
-        let newGuardiansCreatedCount = 0;
-        let existingGuardiansReusedCount = 0;
-        let guardiansReactivatedCount = 0;
-        let studentGuardianLinksCount = 0;
-        let auditLogsCount = 0;
+      // 5. Operational Persistence & Domain Entities Creation
+      let createdStudentsCount = 0;
+      let createdEnrollmentsCount = 0;
+      let resolvedGuardiansCount = 0;
+      let newGuardiansCreatedCount = 0;
+      let existingGuardiansReusedCount = 0;
+      let guardiansReactivatedCount = 0;
+      let studentGuardianLinksCount = 0;
+      let auditLogsCount = 0;
 
-        const auditLogsToInsert = [];
+      const auditLogsToInsert = [];
 
-        // Step A: Iterate over each family group
-        for (const [parentHash, family] of familyMap.entries()) {
-          resolvedGuardiansCount++;
+      // Step A: Iterate over each family group
+      for (const [parentHash, family] of familyMap.entries()) {
+        resolvedGuardiansCount++;
 
-          const existingGuardian = await tx.guardian.findFirst({
-            where: {
-              schoolId,
-              nationalIdHash: parentHash
-            }
-          });
+        const existingGuardian = await tx.guardian.findFirst({
+          where: {
+            schoolId,
+            nationalIdHash: parentHash
+          }
+        });
 
-          let guardianId;
+        let guardianId;
 
-          if (existingGuardian) {
-            guardianId = existingGuardian.id;
+        if (existingGuardian) {
+          guardianId = existingGuardian.id;
 
-            if (existingGuardian.deletedAt) {
-              // Reactivate soft-deleted guardian
-              await tx.guardian.update({
-                where: { id: existingGuardian.id },
-                data: { deletedAt: null, status: 'ACTIVE' }
-              });
-              guardiansReactivatedCount++;
-
-              auditLogsToInsert.push({
-                requestId: context.requestId || null,
-                schoolId,
-                userId: callerUser.id,
-                eventType: 'GUARDIAN_REACTIVATED_FROM_IMPORT',
-                entityName: 'Guardian',
-                entityId: guardianId,
-                action: 'UPDATE',
-                newData: {
-                  nationalIdHash: parentHash,
-                  reactivatedByBatchId: batchId
-                },
-                ipAddress: context.ipAddress || null,
-                userAgent: context.userAgent || null
-              });
-            } else {
-              // Reuse existing active guardian as-is (Policy A)
-              existingGuardiansReusedCount++;
-
-              auditLogsToInsert.push({
-                requestId: context.requestId || null,
-                schoolId,
-                userId: callerUser.id,
-                eventType: 'GUARDIAN_REUSED_FROM_IMPORT',
-                entityName: 'Guardian',
-                entityId: guardianId,
-                action: 'READ',
-                newData: {
-                  nationalIdHash: parentHash,
-                  reusedForBatchId: batchId
-                },
-                ipAddress: context.ipAddress || null,
-                userAgent: context.userAgent || null
-              });
-            }
-          } else {
-            // Create new encrypted guardian
-            const nationalIdEncrypted = encryptText(family.nationalIdPlain);
-            const phoneEncrypted = family.phonePlain ? encryptText(family.phonePlain) : encryptText('0500000000');
-            const phoneHash = family.phonePlain ? computeBlindHash(family.phonePlain) : computeBlindHash('0500000000');
-            const emailEncrypted = family.emailPlain ? encryptText(family.emailPlain) : null;
-            const emailHash = family.emailPlain ? computeBlindHash(family.emailPlain) : null;
-
-            const newGuardian = await tx.guardian.create({
-              data: {
-                schoolId,
-                firstNameAr: family.firstNameAr,
-                familyNameAr: family.familyNameAr,
-                fullNameAr: family.fullNameAr,
-                status: 'ACTIVE',
-                nationalIdEncrypted,
-                nationalIdHash: family.nationalIdHash,
-                phoneEncrypted,
-                phoneHash,
-                emailEncrypted,
-                emailHash
-              }
+          if (existingGuardian.deletedAt) {
+            // Reactivate soft-deleted guardian
+            await tx.guardian.update({
+              where: { id: existingGuardian.id },
+              data: { deletedAt: null, status: 'ACTIVE' }
             });
-
-            guardianId = newGuardian.id;
-            newGuardiansCreatedCount++;
+            guardiansReactivatedCount++;
 
             auditLogsToInsert.push({
               requestId: context.requestId || null,
               schoolId,
               userId: callerUser.id,
-              eventType: 'GUARDIAN_CREATED_FROM_IMPORT',
+              eventType: 'GUARDIAN_REACTIVATED_FROM_IMPORT',
               entityName: 'Guardian',
               entityId: guardianId,
-              action: 'CREATE',
+              action: 'UPDATE',
               newData: {
-                fullNameAr: newGuardian.fullNameAr,
-                nationalIdHash: newGuardian.nationalIdHash,
-                importBatchId: batchId
+                nationalIdHash: parentHash,
+                reactivatedByBatchId: batchId
               },
               ipAddress: context.ipAddress || null,
               userAgent: context.userAgent || null
             });
-          }
-
-          // Step B: Create students and links for this family
-          for (const child of family.children) {
-            const student = await tx.student.create({
-              data: {
-                schoolId,
-                ...child.student
-              }
-            });
-            createdStudentsCount++;
+          } else {
+            // Reuse existing active guardian as-is (Policy A)
+            existingGuardiansReusedCount++;
 
             auditLogsToInsert.push({
               requestId: context.requestId || null,
               schoolId,
               userId: callerUser.id,
-              eventType: 'STUDENT_CREATED_FROM_IMPORT',
-              entityName: 'Student',
-              entityId: student.id,
-              action: 'CREATE',
+              eventType: 'GUARDIAN_REUSED_FROM_IMPORT',
+              entityName: 'Guardian',
+              entityId: guardianId,
+              action: 'IMPORT',
               newData: {
-                studentCode: student.studentCode,
-                fullNameAr: student.fullNameAr,
-                importBatchId: batchId,
-                rowNumber: child.rowNumber
+                nationalIdHash: parentHash,
+                reusedForBatchId: batchId
               },
               ipAddress: context.ipAddress || null,
               userAgent: context.userAgent || null
             });
+          }
+        } else {
+          // Create new encrypted guardian
+          const nationalIdEncrypted = encryptText(family.nationalIdPlain);
+          const phoneEncrypted = family.phonePlain ? encryptText(family.phonePlain) : encryptText('0500000000');
+          const phoneHash = family.phonePlain ? computeBlindHash(family.phonePlain) : computeBlindHash('0500000000');
+          const emailEncrypted = family.emailPlain ? encryptText(family.emailPlain) : null;
+          const emailHash = family.emailPlain ? computeBlindHash(family.emailPlain) : null;
 
-            const targetClass = classMap.get(child.enrollment.sectionVal) || classMap.get(String(child.enrollment.sectionVal).trim());
-            if (targetClass && activeYear) {
-              const enrollment = await tx.studentEnrollment.create({
-                data: {
-                  schoolId,
-                  studentId: student.id,
-                  academicYearId: targetClass.academicYearId || activeYear.id,
-                  classSectionId: targetClass.id,
-                  enrollmentStatus: 'ACTIVE',
-                  enrollmentDate: new Date()
-                }
-              });
-              createdEnrollmentsCount++;
-
-              auditLogsToInsert.push({
-                requestId: context.requestId || null,
-                schoolId,
-                userId: callerUser.id,
-                eventType: 'STUDENT_ENROLLED_FROM_IMPORT',
-                entityName: 'StudentEnrollment',
-                entityId: enrollment.id,
-                action: 'CREATE',
-                newData: {
-                  studentId: student.id,
-                  classSectionId: targetClass.id,
-                  importBatchId: batchId,
-                  rowNumber: child.rowNumber
-                },
-                ipAddress: context.ipAddress || null,
-                userAgent: context.userAgent || null
-              });
+          const newGuardian = await tx.guardian.create({
+            data: {
+              schoolId,
+              firstNameAr: family.firstNameAr,
+              familyNameAr: family.familyNameAr,
+              fullNameAr: family.fullNameAr,
+              status: 'ACTIVE',
+              nationalIdEncrypted,
+              nationalIdHash: family.nationalIdHash,
+              phoneEncrypted,
+              phoneHash,
+              emailEncrypted,
+              emailHash
             }
+          });
 
-            const link = await tx.studentGuardian.create({
+          guardianId = newGuardian.id;
+          newGuardiansCreatedCount++;
+
+          auditLogsToInsert.push({
+            requestId: context.requestId || null,
+            schoolId,
+            userId: callerUser.id,
+            eventType: 'GUARDIAN_CREATED_FROM_IMPORT',
+            entityName: 'Guardian',
+            entityId: guardianId,
+            action: 'CREATE',
+            newData: {
+              fullNameAr: newGuardian.fullNameAr,
+              nationalIdHash: newGuardian.nationalIdHash,
+              importBatchId: batchId
+            },
+            ipAddress: context.ipAddress || null,
+            userAgent: context.userAgent || null
+          });
+        }
+
+        // Step B: Create students and links for this family
+        for (const child of family.children) {
+          const student = await tx.student.create({
+            data: {
+              schoolId,
+              ...child.student
+            }
+          });
+          createdStudentsCount++;
+
+          auditLogsToInsert.push({
+            requestId: context.requestId || null,
+            schoolId,
+            userId: callerUser.id,
+            eventType: 'STUDENT_CREATED_FROM_IMPORT',
+            entityName: 'Student',
+            entityId: student.id,
+            action: 'CREATE',
+            newData: {
+              studentCode: student.studentCode,
+              fullNameAr: student.fullNameAr,
+              importBatchId: batchId,
+              rowNumber: child.rowNumber
+            },
+            ipAddress: context.ipAddress || null,
+            userAgent: context.userAgent || null
+          });
+
+          const targetClass = classMap.get(child.enrollment.sectionVal) || classMap.get(String(child.enrollment.sectionVal).trim());
+          if (targetClass && activeYear) {
+            const enrollment = await tx.studentEnrollment.create({
               data: {
                 schoolId,
                 studentId: student.id,
-                guardianId,
-                relationshipType: child.relationshipType,
-                isPrimary: true,
-                isEmergencyContact: true,
-                isFinanciallyResponsible: true,
-                hasPickupAuthorization: true
+                academicYearId: targetClass.academicYearId || activeYear.id,
+                classSectionId: targetClass.id,
+                enrollmentStatus: 'ACTIVE',
+                enrollmentDate: new Date()
               }
             });
-            studentGuardianLinksCount++;
+            createdEnrollmentsCount++;
 
             auditLogsToInsert.push({
               requestId: context.requestId || null,
               schoolId,
               userId: callerUser.id,
-              eventType: 'STUDENT_GUARDIAN_LINKED_FROM_IMPORT',
-              entityName: 'StudentGuardian',
-              entityId: link.id,
+              eventType: 'STUDENT_ENROLLED_FROM_IMPORT',
+              entityName: 'StudentEnrollment',
+              entityId: enrollment.id,
               action: 'CREATE',
               newData: {
                 studentId: student.id,
-                guardianId,
-                relationshipType: link.relationshipType,
+                classSectionId: targetClass.id,
                 importBatchId: batchId,
                 rowNumber: child.rowNumber
               },
@@ -1192,80 +1216,107 @@ class ImportService {
               userAgent: context.userAgent || null
             });
           }
-        }
 
-        // Step C: Mark Staged Records as PROCESSED
-        await tx.importRecord.updateMany({
-          where: { batchId, status: 'VALID' },
-          data: { status: 'PROCESSED' }
-        });
-
-        // Step D: Mark Batch as COMMITTED
-        await tx.importBatch.update({
-          where: { id: batchId },
-          data: { status: 'COMMITTED' }
-        });
-
-        // Step E: Batch-level Audit Log
-        auditLogsToInsert.push({
-          requestId: context.requestId || null,
-          schoolId,
-          userId: callerUser.id,
-          eventType: 'IMPORT_BATCH_COMMITTED',
-          entityName: 'ImportBatch',
-          entityId: batchId,
-          action: 'CREATE',
-          newData: {
-            entityType: batch.entityType,
-            createdStudentsCount,
-            createdEnrollmentsCount,
-            resolvedGuardiansCount,
-            newGuardiansCreatedCount,
-            existingGuardiansReusedCount,
-            guardiansReactivatedCount,
-            studentGuardianLinksCount
-          },
-          ipAddress: context.ipAddress || null,
-          userAgent: context.userAgent || null
-        });
-
-        if (auditLogsToInsert.length > 0) {
-          await tx.auditLog.createMany({
-            data: auditLogsToInsert
+          const link = await tx.studentGuardian.create({
+            data: {
+              schoolId,
+              studentId: student.id,
+              guardianId,
+              relationshipType: child.relationshipType,
+              isPrimary: true,
+              isEmergencyContact: true,
+              isFinanciallyResponsible: true,
+              hasPickupAuthorization: true
+            }
           });
-          auditLogsCount = auditLogsToInsert.length;
+          studentGuardianLinksCount++;
+
+          auditLogsToInsert.push({
+            requestId: context.requestId || null,
+            schoolId,
+            userId: callerUser.id,
+            eventType: 'STUDENT_GUARDIAN_LINKED_FROM_IMPORT',
+            entityName: 'StudentGuardian',
+            entityId: link.id,
+            action: 'CREATE',
+            newData: {
+              studentId: student.id,
+              guardianId,
+              relationshipType: link.relationshipType,
+              importBatchId: batchId,
+              rowNumber: child.rowNumber
+            },
+            ipAddress: context.ipAddress || null,
+            userAgent: context.userAgent || null
+          });
         }
+      }
 
-        return {
-          batchId,
-          status: 'COMMITTED',
-          summary: {
-            totalProcessedRows: batch.records.length,
-            createdStudentsCount,
-            createdEnrollmentsCount,
-            resolvedGuardiansCount,
-            newGuardiansCreatedCount,
-            existingGuardiansReusedCount,
-            guardiansReactivatedCount,
-            studentGuardianLinksCount,
-            siblingGroupsCount: Array.from(familyMap.values()).filter(f => f.children.length > 1).length,
-            auditLogsCount
-          },
-          committedAt: new Date()
-        };
-      }, {
-        maxWait: 10000,
-        timeout: 60000
+      // Step C: Mark Staged Records as PROCESSED
+      await tx.importRecord.updateMany({
+        where: { batchId, status: 'VALID' },
+        data: { status: 'PROCESSED' }
       });
 
-      return result;
-    } catch (error) {
-      await prisma.importBatch.updateMany({
-        where: { id: batchId, status: 'COMMITTING' },
-        data: { status: 'FAILED' }
+      // Step D: Mark Batch as COMMITTED
+      await tx.importBatch.update({
+        where: { id: batchId },
+        data: { status: 'COMMITTED' }
       });
-      throw error;
-    }
+
+      // Step E: Batch-level Audit Log
+      auditLogsToInsert.push({
+        requestId: context.requestId || null,
+        schoolId,
+        userId: callerUser.id,
+        eventType: 'IMPORT_BATCH_COMMITTED',
+        entityName: 'ImportBatch',
+        entityId: batchId,
+        action: 'CREATE',
+        newData: {
+          entityType: batch.entityType,
+          createdStudentsCount,
+          createdEnrollmentsCount,
+          resolvedGuardiansCount,
+          newGuardiansCreatedCount,
+          existingGuardiansReusedCount,
+          guardiansReactivatedCount,
+          studentGuardianLinksCount
+        },
+        ipAddress: context.ipAddress || null,
+        userAgent: context.userAgent || null
+      });
+
+      if (auditLogsToInsert.length > 0) {
+        await tx.auditLog.createMany({
+          data: auditLogsToInsert
+        });
+        auditLogsCount = auditLogsToInsert.length;
+      }
+
+      return {
+        batchId,
+        status: 'COMMITTED',
+        summary: {
+          totalProcessedRows: records.length,
+          createdStudentsCount,
+          createdEnrollmentsCount,
+          resolvedGuardiansCount,
+          newGuardiansCreatedCount,
+          existingGuardiansReusedCount,
+          guardiansReactivatedCount,
+          studentGuardianLinksCount,
+          siblingGroupsCount: Array.from(familyMap.values()).filter(f => f.children.length > 1).length,
+          auditLogsCount
+        },
+        committedAt: new Date()
+      };
+    }, {
+      maxWait: 10000,
+      timeout: 60000
+    });
+
+    return result;
   }
 
   /**

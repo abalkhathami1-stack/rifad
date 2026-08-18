@@ -1,5 +1,7 @@
 const ImportService = require('../services/import.service');
 const { sendSuccess } = require('../utils/response.util');
+const AppError = require('../utils/app-error.util');
+const { ERROR_CODES } = require('../constants/error-codes');
 
 class ImportController {
   /**
@@ -110,6 +112,33 @@ class ImportController {
   static async commitBatch(req, res, next) {
     try {
       const result = await ImportService.commitBatch(req.params.id, {
+        callerUser: req.user,
+        callerScopes: req.scopes,
+        isPlatformLevel: req.isPlatformLevel,
+        context: {
+          requestId: req.id,
+          ipAddress: req.ip,
+          userAgent: req.get('user-agent')
+        }
+      });
+      return sendSuccess(res, result, 200);
+    } catch (error) {
+      next(error);
+    }
+  }
+
+  /**
+   * POST /api/v1/import/batches/:id/commit-onboarding
+   */
+  static async commitStudentOnboardingBatch(req, res, next) {
+    try {
+      const batchId = req.params.id || req.params.batchId;
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(batchId);
+      if (!isUuid) {
+        throw new AppError('معرف دفعة الاستيراد غير صالح', 400, ERROR_CODES.VALIDATION_ERROR);
+      }
+
+      const result = await ImportService.commitStudentOnboardingBatch(batchId, {
         callerUser: req.user,
         callerScopes: req.scopes,
         isPlatformLevel: req.isPlatformLevel,

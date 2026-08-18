@@ -25,6 +25,7 @@ router.get('/batches/:id/preview', requirePermission(PERMISSIONS.IMPORT_VIEW), I
 
 // 4. Commit & Cancel
 router.post('/batches/:id/commit', requirePermission(PERMISSIONS.IMPORT_COMMIT), ImportController.commitBatch);
+router.post('/batches/:id/commit-onboarding', requirePermission(PERMISSIONS.IMPORT_COMMIT), ImportController.commitStudentOnboardingBatch);
 router.patch('/batches/:id/cancel', requirePermission(PERMISSIONS.IMPORT_CANCEL), ImportController.cancelBatch);
 
 module.exports = router;
