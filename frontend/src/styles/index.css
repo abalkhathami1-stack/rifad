@@ -6,6 +6,7 @@
 @import './teachers.css';
 @import './guardians.css';
 @import './academic.css';
+@import './import.css';
 
 /* CSS Reset & Box Sizing */
 *, *::before, *::after {

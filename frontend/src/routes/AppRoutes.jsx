@@ -18,6 +18,8 @@ import { AcademicStagesPage } from '../pages/AcademicStagesPage';
 import { AcademicClassesPage } from '../pages/AcademicClassesPage';
 import { AcademicSubjectsPage } from '../pages/AcademicSubjectsPage';
 import { AcademicSectionsPage } from '../pages/AcademicSectionsPage';
+import { ImportPage } from '../pages/ImportPage';
+import { ImportBatchPage } from '../pages/ImportBatchPage';
 import { NotFoundPage } from '../pages/NotFoundPage';
 import { PERMISSIONS } from '../constants/permissions';
 
@@ -66,17 +68,10 @@ export function AppRoutes() {
             <Route path="/academic/sections" element={<AcademicSectionsPage />} />
           </Route>
 
+          {/* Import Engine Domain Routes (Protected by IMPORT_VIEW) */}
           <Route element={<ProtectedRoute requiredPermission={PERMISSIONS.IMPORT_VIEW} />}>
-            <Route
-              path="/import"
-              element={
-                <PlaceholderPage
-                  title="محرك استيراد البيانات"
-                  description="معالجة ملفات Excel/CSV للتهيئة الشاملة والكشف التلقائي عن صلات القرابة."
-                  icon="📥"
-                />
-              }
-            />
+            <Route path="/import" element={<ImportPage />} />
+            <Route path="/import/:batchId" element={<ImportBatchPage />} />
           </Route>
 
           <Route element={<ProtectedRoute requiredPermission={PERMISSIONS.PROMOTION_VIEW} />}>

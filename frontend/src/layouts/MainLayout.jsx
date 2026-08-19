@@ -44,6 +44,9 @@ export function MainLayout() {
         if (pathname.startsWith('/guardians/')) {
           return 'الملف الشامل لولي الأمر';
         }
+        if (pathname.startsWith('/import/')) {
+          return 'تفاصيل دفعة الاستيراد';
+        }
         return 'منصة رِفاد';
     }
   };
