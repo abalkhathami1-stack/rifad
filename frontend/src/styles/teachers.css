@@ -1,0 +1,53 @@
+/* Teachers Domain Styles */
+
+/* Subject Tags & Badges */
+.subject-tags-container {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--spacing-1);
+}
+
+.subject-tag {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--font-size-xs);
+  background-color: var(--color-primary-light);
+  color: var(--color-primary);
+  border: 1px solid rgba(11, 77, 60, 0.15);
+  border-radius: var(--radius-sm);
+  padding: 2px 8px;
+  font-weight: 600;
+}
+
+.specialization-badge {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  color: var(--color-secondary);
+  background-color: rgba(197, 160, 89, 0.12);
+  border: 1px solid rgba(197, 160, 89, 0.3);
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+}
+
+.contact-masked-text {
+  font-family: monospace;
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  direction: ltr;
+  display: inline-block;
+}
+
+/* Assignments Grid / Table within Teacher Details */
+.assignment-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background-color: var(--color-surface-hover);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+}

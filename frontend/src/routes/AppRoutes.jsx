@@ -8,6 +8,8 @@ import { DashboardPage } from '../pages/DashboardPage';
 import { PlaceholderPage } from '../pages/PlaceholderPage';
 import { StudentsPage } from '../pages/StudentsPage';
 import { StudentDetailsPage } from '../pages/StudentDetailsPage';
+import { TeachersPage } from '../pages/TeachersPage';
+import { TeacherDetailsPage } from '../pages/TeacherDetailsPage';
 import { NotFoundPage } from '../pages/NotFoundPage';
 import { PERMISSIONS } from '../constants/permissions';
 
@@ -34,17 +36,10 @@ export function AppRoutes() {
             <Route path="/students/:id" element={<StudentDetailsPage />} />
           </Route>
 
+          {/* Teachers Domain Routes (Protected by TEACHERS_VIEW) */}
           <Route element={<ProtectedRoute requiredPermission={PERMISSIONS.TEACHERS_VIEW} />}>
-            <Route
-              path="/teachers"
-              element={
-                <PlaceholderPage
-                  title="إدارة الهيئة التعليمية"
-                  description="ملفات المعلمين، التخصصات الأكاديمية، التأهيل بالمواد، وإسناد الشعب الدراسية."
-                  icon="👨‍🏫"
-                />
-              }
-            />
+            <Route path="/teachers" element={<TeachersPage />} />
+            <Route path="/teachers/:id" element={<TeacherDetailsPage />} />
           </Route>
 
           <Route element={<ProtectedRoute requiredPermission={PERMISSIONS.GUARDIANS_VIEW} />}>

@@ -28,6 +28,9 @@ export function MainLayout() {
         if (pathname.startsWith('/students/')) {
           return 'الملف الشامل للطالب';
         }
+        if (pathname.startsWith('/teachers/')) {
+          return 'الملف الشامل للمعلم';
+        }
         return 'منصة رِفاد';
     }
   };

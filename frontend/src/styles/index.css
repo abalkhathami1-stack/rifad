@@ -3,6 +3,7 @@
 @import './auth.css';
 @import './dashboard.css';
 @import './students.css';
+@import './teachers.css';
 
 /* CSS Reset & Box Sizing */
 *, *::before, *::after {
