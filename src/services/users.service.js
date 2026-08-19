@@ -482,6 +482,12 @@ class UsersService {
       throw new AppError('هذا الدور مسند للمستخدم مسبقاً بنفس النطاق', 409, ERROR_CODES.CONFLICT);
     }
 
+    // Note: Self-assignment (callerUser.id === userId) is intentionally NOT
+    // additionally restricted here — the privilege-escalation and school-scope
+    // guards above already apply identically regardless of target identity.
+    // It is only flagged in the audit log below for visibility.
+    const isSelfModification = callerUser.id === userId;
+
     const assignment = await prisma.$transaction(async (tx) => {
       const created = await tx.userRoleAssignment.create({
         data: {
@@ -511,7 +517,8 @@ class UsersService {
             roleCode,
             scopeType,
             schoolId,
-            sectionDivisionId
+            sectionDivisionId,
+            selfModification: isSelfModification
           },
           ipAddress: context.ipAddress || null,
           userAgent: context.userAgent || null
@@ -563,6 +570,35 @@ class UsersService {
       }
     }
 
+    // Self-Protection Guard: Prevent destructive self role/scope mutation.
+    // Independent of the "last PLATFORM_OWNER in the system" check above —
+    // this applies to the CALLER's own account specifically, regardless of
+    // how many other PLATFORM_OWNER assignments exist elsewhere.
+    const isSelfModification = callerUser.id === userId;
+    if (isSelfModification) {
+      // A user may never remove their own PLATFORM_OWNER assignment,
+      // even if other Platform Owners exist in the system.
+      if (assignment.role.code === 'PLATFORM_OWNER') {
+        throw new AppError(
+          'لا يمكنك إلغاء دور مالك المنصة الخاص بحسابك بنفسك',
+          400,
+          ERROR_CODES.BAD_REQUEST
+        );
+      }
+
+      // A user may never leave their own account without any active role assignment.
+      const remainingAssignments = await prisma.userRoleAssignment.count({
+        where: { userId }
+      });
+      if (remainingAssignments <= 1) {
+        throw new AppError(
+          'لا يمكنك حذف آخر دور إداري نشط لحسابك، يرجى الطلب من إداري آخر تنفيذ ذلك',
+          400,
+          ERROR_CODES.BAD_REQUEST
+        );
+      }
+    }
+
     await prisma.$transaction(async (tx) => {
       await tx.userRoleAssignment.delete({
         where: { id: assignmentId }
@@ -581,7 +617,8 @@ class UsersService {
             userId,
             roleCode: assignment.role.code,
             scopeType: assignment.scopeType,
-            schoolId: assignment.schoolId
+            schoolId: assignment.schoolId,
+            selfModification: isSelfModification
           },
           ipAddress: context.ipAddress || null,
           userAgent: context.userAgent || null

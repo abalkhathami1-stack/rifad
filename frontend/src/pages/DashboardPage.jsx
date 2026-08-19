@@ -1,10 +1,11 @@
 import React from 'react';
 import { useAuth } from '../context/AuthContext';
+import { formatPrimaryRoleLabel } from '../utils/roleLabels';
 
 export function DashboardPage() {
   const { user, roles, scopes, isPlatformLevel } = useAuth();
 
-  const primaryRole = roles && roles.length > 0 ? (roles[0].nameAr || roles[0].code) : 'مستخدم النظام';
+  const primaryRole = formatPrimaryRoleLabel(roles, 'مستخدم النظام');
   const initialLetter = user?.fullName ? user.fullName.trim().charAt(0) : 'ر';
 
   return (

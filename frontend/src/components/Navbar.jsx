@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { formatPrimaryRoleLabel } from '../utils/roleLabels';
 
 export function Navbar({ title = 'لوحة التحكم' }) {
   const { user, roles, logout } = useAuth();
@@ -14,7 +15,7 @@ export function Navbar({ title = 'لوحة التحكم' }) {
     }
   };
 
-  const primaryRole = roles && roles.length > 0 ? (roles[0].nameAr || roles[0].code) : '';
+  const primaryRole = formatPrimaryRoleLabel(roles, '');
 
   return (
     <header className="top-header">

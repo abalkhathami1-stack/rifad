@@ -1,7 +1,11 @@
 const crypto = require('crypto');
+const env = require('../config/env');
 
-const ENCRYPTION_KEY = process.env.PII_ENCRYPTION_KEY || 'rifad_pii_encryption_key_32_bytes_len_2026!'; // 32 bytes
-const BLIND_INDEX_SALT = process.env.BLIND_INDEX_SALT || 'rifad_blind_index_salt_secure_2026!';
+// Resolved centrally (with production fail-fast validation) in src/config/env.js.
+// Do NOT read process.env directly here — this avoids duplicating fallback/
+// validation logic across files.
+const ENCRYPTION_KEY = env.PII_ENCRYPTION_KEY;
+const BLIND_INDEX_SALT = env.BLIND_INDEX_SALT;
 
 function generateOpaqueToken() {
   return crypto.randomBytes(32).toString('hex');

@@ -62,9 +62,10 @@ export function AuthProvider({ children }) {
       setPermissions(data.permissions || []);
       setScopes(data.scopes || []);
       
-      const isPlatform = (data.roles || []).some(
-        (r) => r.code === 'PLATFORM_OWNER'
-      ) || (data.scopes || []).some((s) => s.scopeType === 'PLATFORM');
+      // data.roles is a flat array of role code strings (e.g. ["SCHOOL_ADMIN"]),
+      // as returned by both POST /auth/login and GET /auth/me.
+      const isPlatform = (data.roles || []).includes('PLATFORM_OWNER')
+        || (data.scopes || []).some((s) => s.scopeType === 'PLATFORM');
       
       setIsPlatformLevel(isPlatform);
       return data;
@@ -103,11 +104,15 @@ export function AuthProvider({ children }) {
 
   /**
    * Checks if current user has a specific role code.
-   * Evaluates only the explicit roles array.
+   * `roles` is a flat array of role code strings as returned by the backend
+   * (POST /auth/login and GET /auth/me), e.g. ["SCHOOL_ADMIN"].
+   * NOTE: This is for display/UX branching only (e.g. labels, empty states).
+   * It must NEVER be used as a substitute for can(permissionCode), which
+   * remains the sole reference for UI permission gating.
    */
   const hasRole = useCallback((roleCode) => {
     if (!roleCode || !Array.isArray(roles)) return false;
-    return roles.some((r) => r.code === roleCode);
+    return roles.includes(roleCode);
   }, [roles]);
 
   const value = {

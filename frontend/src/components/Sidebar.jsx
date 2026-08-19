@@ -2,6 +2,7 @@ import React from 'react';
 import { NavLink } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { PERMISSIONS } from '../constants/permissions';
+import { formatPrimaryRoleLabel } from '../utils/roleLabels';
 
 export function Sidebar() {
   const { user, roles, can } = useAuth();
@@ -63,7 +64,7 @@ export function Sidebar() {
     return can(item.permission);
   });
 
-  const primaryRole = roles && roles.length > 0 ? (roles[0].nameAr || roles[0].code) : 'مستخدم';
+  const primaryRole = formatPrimaryRoleLabel(roles, 'مستخدم');
   const initialLetter = user?.fullName ? user.fullName.trim().charAt(0) : 'ر';
 
   return (
