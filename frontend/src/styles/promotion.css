@@ -1,0 +1,131 @@
+/* Promotion & Rollover Domain Styles */
+
+/* Stepper Component */
+.promotion-stepper {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--spacing-8);
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--spacing-4) var(--spacing-8);
+  position: relative;
+}
+
+.promotion-stepper .stepper-step {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-3);
+  position: relative;
+  z-index: 2;
+}
+
+.promotion-stepper .step-number {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background-color: var(--color-surface-hover);
+  border: 2px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: var(--font-size-sm);
+  color: var(--color-text-secondary);
+  transition: all var(--transition-fast);
+}
+
+.promotion-stepper .stepper-step.active .step-number {
+  background-color: var(--color-primary);
+  border-color: var(--color-primary);
+  color: var(--color-text-on-primary);
+}
+
+.promotion-stepper .stepper-step.completed .step-number {
+  background-color: var(--color-success);
+  border-color: var(--color-success);
+  color: var(--color-text-on-primary);
+}
+
+.promotion-stepper .step-title {
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+.promotion-stepper .stepper-step.active .step-title {
+  color: var(--color-primary);
+  font-weight: 700;
+}
+
+.promotion-stepper .stepper-step.completed .step-title {
+  color: var(--color-text-main);
+}
+
+/* Metrics Summary Grid */
+.promotion-metrics-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: var(--spacing-4);
+  margin-bottom: var(--spacing-6);
+}
+
+.promotion-metric-card {
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--spacing-5);
+  text-align: center;
+}
+
+.promotion-metric-card .metric-number {
+  font-size: var(--font-size-2xl);
+  font-weight: 800;
+  line-height: 1.2;
+  margin-bottom: var(--spacing-1);
+}
+
+.metric-number.promoted { color: var(--color-success); }
+.metric-number.retained { color: var(--color-warning); }
+.metric-number.graduated { color: var(--color-primary); }
+
+/* Overrides & Badges */
+.decision-override-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  color: #b45309;
+  background-color: #fef3c7;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  margin-top: 4px;
+}
+
+.action-bar-container {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--spacing-4);
+  margin-bottom: var(--spacing-6);
+  padding: var(--spacing-4) var(--spacing-6);
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+}
+
+.action-buttons-group {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-3);
+}
+
+.decision-reason-text {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+  font-style: italic;
+  margin-top: 2px;
+}

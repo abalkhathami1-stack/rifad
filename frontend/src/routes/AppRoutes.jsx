@@ -20,6 +20,8 @@ import { AcademicSubjectsPage } from '../pages/AcademicSubjectsPage';
 import { AcademicSectionsPage } from '../pages/AcademicSectionsPage';
 import { ImportPage } from '../pages/ImportPage';
 import { ImportBatchPage } from '../pages/ImportBatchPage';
+import { PromotionPage } from '../pages/PromotionPage';
+import { PromotionBatchPage } from '../pages/PromotionBatchPage';
 import { NotFoundPage } from '../pages/NotFoundPage';
 import { PERMISSIONS } from '../constants/permissions';
 
@@ -74,17 +76,10 @@ export function AppRoutes() {
             <Route path="/import/:batchId" element={<ImportBatchPage />} />
           </Route>
 
+          {/* Promotion & Rollover Domain Routes (Protected by PROMOTION_VIEW) */}
           <Route element={<ProtectedRoute requiredPermission={PERMISSIONS.PROMOTION_VIEW} />}>
-            <Route
-              path="/promotion"
-              element={
-                <PlaceholderPage
-                  title="الترفيع والترحيل السنوي"
-                  description="إنشاء دفعات الترفيع، توليد القرارات آلياً، والترحيل للعام الدراسي التالي."
-                  icon="🔄"
-                />
-              }
-            />
+            <Route path="/promotion" element={<PromotionPage />} />
+            <Route path="/promotion/:batchId" element={<PromotionBatchPage />} />
           </Route>
 
           <Route element={<ProtectedRoute requiredPermission={PERMISSIONS.USERS_VIEW} />}>

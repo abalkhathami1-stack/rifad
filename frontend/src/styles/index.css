@@ -7,6 +7,7 @@
 @import './guardians.css';
 @import './academic.css';
 @import './import.css';
+@import './promotion.css';
 
 /* CSS Reset & Box Sizing */
 *, *::before, *::after {

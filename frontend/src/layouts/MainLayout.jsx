@@ -47,6 +47,9 @@ export function MainLayout() {
         if (pathname.startsWith('/import/')) {
           return 'تفاصيل دفعة الاستيراد';
         }
+        if (pathname.startsWith('/promotion/')) {
+          return 'تفاصيل دفعة الترفيع والقرارات';
+        }
         return 'منصة رِفاد';
     }
   };
