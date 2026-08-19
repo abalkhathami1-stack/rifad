@@ -31,6 +31,9 @@ export function MainLayout() {
         if (pathname.startsWith('/teachers/')) {
           return 'الملف الشامل للمعلم';
         }
+        if (pathname.startsWith('/guardians/')) {
+          return 'الملف الشامل لولي الأمر';
+        }
         return 'منصة رِفاد';
     }
   };

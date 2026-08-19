@@ -4,6 +4,7 @@
 @import './dashboard.css';
 @import './students.css';
 @import './teachers.css';
+@import './guardians.css';
 
 /* CSS Reset & Box Sizing */
 *, *::before, *::after {

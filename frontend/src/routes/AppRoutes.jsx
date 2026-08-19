@@ -10,6 +10,8 @@ import { StudentsPage } from '../pages/StudentsPage';
 import { StudentDetailsPage } from '../pages/StudentDetailsPage';
 import { TeachersPage } from '../pages/TeachersPage';
 import { TeacherDetailsPage } from '../pages/TeacherDetailsPage';
+import { GuardiansPage } from '../pages/GuardiansPage';
+import { GuardianDetailsPage } from '../pages/GuardianDetailsPage';
 import { NotFoundPage } from '../pages/NotFoundPage';
 import { PERMISSIONS } from '../constants/permissions';
 
@@ -42,17 +44,10 @@ export function AppRoutes() {
             <Route path="/teachers/:id" element={<TeacherDetailsPage />} />
           </Route>
 
+          {/* Guardians Domain Routes (Protected by GUARDIANS_VIEW) */}
           <Route element={<ProtectedRoute requiredPermission={PERMISSIONS.GUARDIANS_VIEW} />}>
-            <Route
-              path="/guardians"
-              element={
-                <PlaceholderPage
-                  title="إدارة أولياء الأمور"
-                  description="سجل أولياء الأمور، تشفير بيانات الاتصال والهوية، والربط بالطلاب."
-                  icon="👨‍👩‍👧"
-                />
-              }
-            />
+            <Route path="/guardians" element={<GuardiansPage />} />
+            <Route path="/guardians/:id" element={<GuardianDetailsPage />} />
           </Route>
 
           <Route element={<ProtectedRoute requiredPermission={PERMISSIONS.ACADEMIC_VIEW} />}>
