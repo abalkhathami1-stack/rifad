@@ -18,6 +18,16 @@ export function MainLayout() {
         return 'إدارة أولياء الأمور';
       case '/academic':
         return 'الهيكل الأكاديمي والفصول';
+      case '/academic/years':
+        return 'السنوات والفصول الدراسية';
+      case '/academic/stages':
+        return 'المراحل والصفوف الدراسية';
+      case '/academic/classes':
+        return 'الشعب الصفية والفصول';
+      case '/academic/subjects':
+        return 'المواد الدراسية';
+      case '/academic/sections':
+        return 'الأقسام التعليمية';
       case '/import':
         return 'محرك استيراد البيانات';
       case '/promotion':

@@ -12,6 +12,12 @@ import { TeachersPage } from '../pages/TeachersPage';
 import { TeacherDetailsPage } from '../pages/TeacherDetailsPage';
 import { GuardiansPage } from '../pages/GuardiansPage';
 import { GuardianDetailsPage } from '../pages/GuardianDetailsPage';
+import { AcademicPage } from '../pages/AcademicPage';
+import { AcademicYearsPage } from '../pages/AcademicYearsPage';
+import { AcademicStagesPage } from '../pages/AcademicStagesPage';
+import { AcademicClassesPage } from '../pages/AcademicClassesPage';
+import { AcademicSubjectsPage } from '../pages/AcademicSubjectsPage';
+import { AcademicSectionsPage } from '../pages/AcademicSectionsPage';
 import { NotFoundPage } from '../pages/NotFoundPage';
 import { PERMISSIONS } from '../constants/permissions';
 
@@ -50,17 +56,14 @@ export function AppRoutes() {
             <Route path="/guardians/:id" element={<GuardianDetailsPage />} />
           </Route>
 
+          {/* Academic Domain Routes (Protected by ACADEMIC_VIEW) */}
           <Route element={<ProtectedRoute requiredPermission={PERMISSIONS.ACADEMIC_VIEW} />}>
-            <Route
-              path="/academic"
-              element={
-                <PlaceholderPage
-                  title="الهيكل الأكاديمي والفصول"
-                  description="إدارة المراحل التعليمية، الصفوف، الأقسام، الشعب، والمواد الدراسية."
-                  icon="🏫"
-                />
-              }
-            />
+            <Route path="/academic" element={<AcademicPage />} />
+            <Route path="/academic/years" element={<AcademicYearsPage />} />
+            <Route path="/academic/stages" element={<AcademicStagesPage />} />
+            <Route path="/academic/classes" element={<AcademicClassesPage />} />
+            <Route path="/academic/subjects" element={<AcademicSubjectsPage />} />
+            <Route path="/academic/sections" element={<AcademicSectionsPage />} />
           </Route>
 
           <Route element={<ProtectedRoute requiredPermission={PERMISSIONS.IMPORT_VIEW} />}>
