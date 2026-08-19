@@ -25,6 +25,9 @@ export function MainLayout() {
       case '/users':
         return 'إدارة المستخدمين والصلاحيات';
       default:
+        if (pathname.startsWith('/students/')) {
+          return 'الملف الشامل للطالب';
+        }
         return 'منصة رِفاد';
     }
   };

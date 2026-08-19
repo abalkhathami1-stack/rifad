@@ -6,6 +6,8 @@ import { ProtectedRoute } from './ProtectedRoute';
 import { LoginPage } from '../pages/LoginPage';
 import { DashboardPage } from '../pages/DashboardPage';
 import { PlaceholderPage } from '../pages/PlaceholderPage';
+import { StudentsPage } from '../pages/StudentsPage';
+import { StudentDetailsPage } from '../pages/StudentDetailsPage';
 import { NotFoundPage } from '../pages/NotFoundPage';
 import { PERMISSIONS } from '../constants/permissions';
 
@@ -26,18 +28,10 @@ export function AppRoutes() {
           {/* Main Dashboard */}
           <Route path="/dashboard" element={<DashboardPage />} />
 
-          {/* Domain Route Placeholders with Role-Aware Guards */}
+          {/* Students Domain Routes (Protected by STUDENTS_VIEW) */}
           <Route element={<ProtectedRoute requiredPermission={PERMISSIONS.STUDENTS_VIEW} />}>
-            <Route
-              path="/students"
-              element={
-                <PlaceholderPage
-                  title="إدارة شؤون الطلاب"
-                  description="سجل الطلاب المعتمد، التسكين الأكاديمي في الشعب، إدارة الهوية الوطنية وتاريخ القيد."
-                  icon="🎓"
-                />
-              }
-            />
+            <Route path="/students" element={<StudentsPage />} />
+            <Route path="/students/:id" element={<StudentDetailsPage />} />
           </Route>
 
           <Route element={<ProtectedRoute requiredPermission={PERMISSIONS.TEACHERS_VIEW} />}>
