@@ -591,6 +591,13 @@ class AcademicService {
     if (data.stageId !== undefined) updateData.stageId = data.stageId;
 
     const updated = await prisma.$transaction(async (tx) => {
+      // RIFAD-GAP-008: mirror createGrade's existing validation pattern — any new stageId
+      // must exist, be active, and belong to the Grade's own schoolId.
+      if (updateData.stageId !== undefined) {
+        const stage = await tx.educationalStage.findFirst({ where: { id: updateData.stageId, schoolId: grade.schoolId, deletedAt: null } });
+        if (!stage) throw new AppError('المرحلة المحددة غير موجودة في هذه المدرسة', 404, ERROR_CODES.NOT_FOUND);
+      }
+
       const res = await tx.grade.update({ where: { id }, data: updateData });
       await tx.auditLog.create({
         data: {
@@ -674,6 +681,17 @@ class AcademicService {
     }
 
     const classSection = await prisma.$transaction(async (tx) => {
+      // RIFAD-GAP-006: verify every referenced FK belongs to the resolved schoolId
+      // (Postgres FK constraints alone do not enforce same-school ownership).
+      const [academicYear, grade, sectionDivision] = await Promise.all([
+        tx.academicYear.findFirst({ where: { id: academicYearId, schoolId, deletedAt: null } }),
+        tx.grade.findFirst({ where: { id: gradeId, schoolId, deletedAt: null } }),
+        tx.schoolSection.findFirst({ where: { id: sectionDivisionId, schoolId, deletedAt: null } })
+      ]);
+      if (!academicYear) throw new AppError('السنة الدراسية المحددة غير موجودة في هذه المدرسة', 404, ERROR_CODES.NOT_FOUND);
+      if (!grade) throw new AppError('الصف الدراسي المحدد غير موجود في هذه المدرسة', 404, ERROR_CODES.NOT_FOUND);
+      if (!sectionDivision) throw new AppError('القسم المحدد غير موجود في هذه المدرسة', 404, ERROR_CODES.NOT_FOUND);
+
       const created = await tx.classSection.create({
         data: {
           schoolId,
@@ -720,6 +738,17 @@ class AcademicService {
     if (data.sectionDivisionId !== undefined) updateData.sectionDivisionId = data.sectionDivisionId;
 
     const updated = await prisma.$transaction(async (tx) => {
+      // RIFAD-GAP-007: any new gradeId/sectionDivisionId must belong to the TARGET
+      // ClassSection's own schoolId (classSection.schoolId), not any client-supplied value.
+      if (updateData.gradeId !== undefined) {
+        const grade = await tx.grade.findFirst({ where: { id: updateData.gradeId, schoolId: classSection.schoolId, deletedAt: null } });
+        if (!grade) throw new AppError('الصف الدراسي المحدد غير موجود في هذه المدرسة', 404, ERROR_CODES.NOT_FOUND);
+      }
+      if (updateData.sectionDivisionId !== undefined) {
+        const sectionDivision = await tx.schoolSection.findFirst({ where: { id: updateData.sectionDivisionId, schoolId: classSection.schoolId, deletedAt: null } });
+        if (!sectionDivision) throw new AppError('القسم المحدد غير موجود في هذه المدرسة', 404, ERROR_CODES.NOT_FOUND);
+      }
+
       const res = await tx.classSection.update({ where: { id }, data: updateData });
       await tx.auditLog.create({
         data: {
