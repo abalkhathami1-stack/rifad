@@ -71,6 +71,7 @@ class TeachersController {
         callerUser: req.user,
         callerScopes: req.scopes,
         isPlatformLevel: req.isPlatformLevel,
+        callerPermissions: req.permissions,
         data: req.body,
         context: { requestId: req.id, ipAddress: req.ip, userAgent: req.get('user-agent') }
       });
@@ -84,6 +85,7 @@ class TeachersController {
         callerUser: req.user,
         callerScopes: req.scopes,
         isPlatformLevel: req.isPlatformLevel,
+        callerPermissions: req.permissions,
         data: req.body,
         context: { requestId: req.id, ipAddress: req.ip, userAgent: req.get('user-agent') }
       });
@@ -97,6 +99,7 @@ class TeachersController {
         callerUser: req.user,
         callerScopes: req.scopes,
         isPlatformLevel: req.isPlatformLevel,
+        callerPermissions: req.permissions,
         status: req.body.status,
         context: { requestId: req.id, ipAddress: req.ip, userAgent: req.get('user-agent') }
       });

@@ -1,6 +1,7 @@
 const request = require('supertest');
 const app = require('../src/app');
 const prisma = require('../src/config/prisma');
+const { decryptText } = require('../src/utils/crypto.util');
 const {
   captureRealPlatformOwnerBaseline,
   createEphemeralPlatformOwner,
@@ -176,6 +177,43 @@ async function runTeachersTestSuite() {
     assert(teacher1.schoolId === schoolA.id, 'Teacher assigned to School A');
 
     // ----------------------------------------------------
+    // TEST: RIFAD-GAP-001 / RIFAD-GAP-002 Regression — Create Response Must Not
+    // Expose Encrypted/Hash Fields, and Must NOT Grant Plaintext PII via the
+    // Former Hardcoded 'teachers.view_sensitive' Bypass (SCHOOL_ADMIN does not
+    // legitimately hold that permission — RIFAD-GAP-003 stays OPEN/undefined).
+    // ----------------------------------------------------
+    console.log('\n--- 6b. RIFAD-GAP-001/002 Regression: Create Response Hygiene ---');
+    const createBodyText = JSON.stringify(createTchRes.body);
+
+    assert(!Object.prototype.hasOwnProperty.call(teacher1, 'nationalIdEncrypted'), 'Create response does not contain nationalIdEncrypted');
+    assert(!Object.prototype.hasOwnProperty.call(teacher1, 'phoneEncrypted'), 'Create response does not contain phoneEncrypted');
+    assert(!Object.prototype.hasOwnProperty.call(teacher1, 'emailEncrypted'), 'Create response does not contain emailEncrypted');
+    assert(!Object.prototype.hasOwnProperty.call(teacher1, 'nationalIdHash'), 'Create response does not contain nationalIdHash');
+    assert(!Object.prototype.hasOwnProperty.call(teacher1, 'phoneHash'), 'Create response does not contain phoneHash');
+    assert(!Object.prototype.hasOwnProperty.call(teacher1, 'emailHash'), 'Create response does not contain emailHash');
+    assert(!createBodyText.includes('Encrypted') && !createBodyText.includes('Hash'), 'Create response body contains no *Encrypted/*Hash keys anywhere');
+
+    // GAP-002: adminCookie is SCHOOL_ADMIN (holds teachers.create, NOT teachers.view_sensitive,
+    // NOT isPlatformLevel). Before the fix, createTeacher hardcoded callerPermissions to
+    // ['teachers.view_sensitive'], so this same caller received full plaintext PII. Now it
+    // must receive the same masked view any non-sensitive caller gets.
+    assert(Boolean(teacher1.nationalId) && teacher1.nationalId.includes('*') && teacher1.nationalId !== rawNid, 'Create response nationalId is MASKED, not plaintext (hardcoded bypass removed)');
+    assert(Boolean(teacher1.phone) && teacher1.phone.includes('*') && teacher1.phone !== rawPhone, 'Create response phone is MASKED, not plaintext (hardcoded bypass removed)');
+    assert(Boolean(teacher1.email) && teacher1.email.includes('*') && teacher1.email !== rawEmail, 'Create response email is MASKED, not plaintext (hardcoded bypass removed)');
+    assert(!createBodyText.includes(rawNid), 'Create response body does not leak the raw national ID sentinel anywhere');
+    assert(!createBodyText.includes(rawPhone), 'Create response body does not leak the raw phone sentinel anywhere');
+    assert(!createBodyText.includes(rawEmail), 'Create response body does not leak the raw email sentinel anywhere');
+
+    // Existing non-sensitive fields remain intact
+    assert(teacher1.employeeNumber && teacher1.status === 'ACTIVE' && teacher1.nationality === 'سعودي', 'Non-sensitive teacher fields remain intact in create response');
+
+    // Database encryption itself is unchanged — this fix only touches response shaping
+    const dbTeacher1 = await prisma.teacher.findUnique({ where: { id: teacher1.id } });
+    assert(dbTeacher1.nationalIdEncrypted !== rawNid, 'National ID is still stored encrypted (not plaintext) in the database');
+    assert(decryptText(dbTeacher1.nationalIdEncrypted) === rawNid, 'Stored national ID still decrypts correctly with AES-256-GCM (encryption untouched)');
+    assert(Boolean(dbTeacher1.nationalIdHash), 'Blind-index hash still generated and stored (untouched)');
+
+    // ----------------------------------------------------
     // TEST: Scope Guard - School Admin A cannot create in School B
     // ----------------------------------------------------
     console.log('\n--- 7. Multi-Tenancy Scope Violation (School A Admin -> School B) ---');
@@ -233,6 +271,112 @@ async function runTeachersTestSuite() {
     assert(guestViewTchRes.body.data.teacher.nationalId.includes('*'), 'National ID is MASKED for unauthorized user');
     assert(guestViewTchRes.body.data.teacher.phone.includes('*'), 'Phone is MASKED for unauthorized user');
     assert(guestViewTchRes.body.data.teacher.email.includes('*'), 'Email is MASKED for unauthorized user');
+
+    // ----------------------------------------------------
+    // TEST: RIFAD-GAP-001 Regression — PATCH /teachers/:id Response Hygiene
+    // ----------------------------------------------------
+    console.log('\n--- 8b. RIFAD-GAP-001 Regression: PATCH /teachers/:id Response Hygiene ---');
+    const newPhone = '0559876543';
+    const newEmail = 'ahmed.updated@rifad.edu.sa';
+    const patchTchRes = await request(app)
+      .patch(`/api/v1/teachers/${teacher1.id}`)
+      .set('Cookie', adminCookie)
+      .send({ nationality: 'سعودي', phone: newPhone, email: newEmail });
+
+    assert(patchTchRes.status === 200, 'PATCH /teachers/:id succeeds for authorized caller (200 OK)');
+    const patchedTeacher = patchTchRes.body.data.teacher;
+    const patchBodyText = JSON.stringify(patchTchRes.body);
+
+    assert(!Object.prototype.hasOwnProperty.call(patchedTeacher, 'nationalIdEncrypted'), 'PATCH response does not contain nationalIdEncrypted');
+    assert(!Object.prototype.hasOwnProperty.call(patchedTeacher, 'phoneEncrypted'), 'PATCH response does not contain phoneEncrypted');
+    assert(!Object.prototype.hasOwnProperty.call(patchedTeacher, 'emailEncrypted'), 'PATCH response does not contain emailEncrypted');
+    assert(!Object.prototype.hasOwnProperty.call(patchedTeacher, 'nationalIdHash'), 'PATCH response does not contain nationalIdHash');
+    assert(!Object.prototype.hasOwnProperty.call(patchedTeacher, 'phoneHash'), 'PATCH response does not contain phoneHash');
+    assert(!Object.prototype.hasOwnProperty.call(patchedTeacher, 'emailHash'), 'PATCH response does not contain emailHash');
+    assert(!patchBodyText.includes('Encrypted') && !patchBodyText.includes('Hash'), 'PATCH response body contains no *Encrypted/*Hash keys anywhere');
+    assert(!patchBodyText.includes(newPhone) && !patchBodyText.includes(newEmail), 'PATCH response body does not leak the new phone/email sentinels in plaintext (SCHOOL_ADMIN has no view_sensitive)');
+    assert(Boolean(patchedTeacher.phone) && patchedTeacher.phone.includes('*'), 'PATCH response phone is MASKED for caller without view_sensitive');
+    assert(Boolean(patchedTeacher.email) && patchedTeacher.email.includes('*'), 'PATCH response email is MASKED for caller without view_sensitive');
+    assert(patchedTeacher.employeeNumber === teacher1.employeeNumber && patchedTeacher.fullNameAr === teacher1.fullNameAr, 'Non-sensitive teacher fields remain intact in PATCH response');
+
+    // ----------------------------------------------------
+    // TEST: RIFAD-GAP-001 Regression — PATCH /teachers/:id/status Response Hygiene
+    // ----------------------------------------------------
+    console.log('\n--- 8c. RIFAD-GAP-001 Regression: PATCH /teachers/:id/status Response Hygiene ---');
+    const patchStatusRes = await request(app)
+      .patch(`/api/v1/teachers/${teacher1.id}/status`)
+      .set('Cookie', adminCookie)
+      .send({ status: 'ON_LEAVE' });
+
+    assert(patchStatusRes.status === 200, 'PATCH /teachers/:id/status succeeds for authorized caller (200 OK)');
+    const statusTeacher = patchStatusRes.body.data.teacher;
+    const statusBodyText = JSON.stringify(patchStatusRes.body);
+
+    assert(!Object.prototype.hasOwnProperty.call(statusTeacher, 'nationalIdEncrypted'), 'PATCH status response does not contain nationalIdEncrypted');
+    assert(!Object.prototype.hasOwnProperty.call(statusTeacher, 'phoneEncrypted'), 'PATCH status response does not contain phoneEncrypted');
+    assert(!Object.prototype.hasOwnProperty.call(statusTeacher, 'emailEncrypted'), 'PATCH status response does not contain emailEncrypted');
+    assert(!Object.prototype.hasOwnProperty.call(statusTeacher, 'nationalIdHash'), 'PATCH status response does not contain nationalIdHash');
+    assert(!Object.prototype.hasOwnProperty.call(statusTeacher, 'phoneHash'), 'PATCH status response does not contain phoneHash');
+    assert(!Object.prototype.hasOwnProperty.call(statusTeacher, 'emailHash'), 'PATCH status response does not contain emailHash');
+    assert(!statusBodyText.includes('Encrypted') && !statusBodyText.includes('Hash'), 'PATCH status response body contains no *Encrypted/*Hash keys anywhere');
+    assert(statusTeacher.status === 'ON_LEAVE', 'Status field updated correctly and still present');
+
+    // Reset status back to ACTIVE so subsequent steps (assignment guard, etc.) are unaffected
+    await request(app)
+      .patch(`/api/v1/teachers/${teacher1.id}/status`)
+      .set('Cookie', adminCookie)
+      .send({ status: 'ACTIVE' });
+
+    // ----------------------------------------------------
+    // TEST: Unauthorized behavior unchanged (auth model untouched by this fix)
+    // ----------------------------------------------------
+    console.log('\n--- 8d. Unauthorized Access Unchanged ---');
+    const noAuthPatchRes = await request(app)
+      .patch(`/api/v1/teachers/${teacher1.id}`)
+      .send({ nationality: 'test' });
+    assert(noAuthPatchRes.status === 401, 'Unauthenticated PATCH /teachers/:id still rejected (401) — auth model unchanged');
+
+    const noAuthStatusRes = await request(app)
+      .patch(`/api/v1/teachers/${teacher1.id}/status`)
+      .send({ status: 'ON_LEAVE' });
+    assert(noAuthStatusRes.status === 401, 'Unauthenticated PATCH /teachers/:id/status still rejected (401) — auth model unchanged');
+
+    // ----------------------------------------------------
+    // TEST: Cross-school scope behavior unchanged for PATCH endpoints
+    // ----------------------------------------------------
+    console.log('\n--- 8e. Cross-School Scope Guard Unchanged for PATCH Endpoints ---');
+    const adminBUsername = `admin.tchB.${Date.now()}`;
+    const adminBPass = 'Pass123!TchAdminB';
+    const adminBRes = await request(app)
+      .post('/api/v1/users')
+      .set('Cookie', ownerCookie)
+      .send({
+        username: adminBUsername,
+        password: adminBPass,
+        fullName: 'مدير مدرسة ب',
+        roleCode: 'SCHOOL_ADMIN',
+        scopeType: 'SCHOOL',
+        schoolId: schoolB.id
+      });
+    createdUserIds.push(adminBRes.body.data.user.id);
+
+    const adminBLoginRes = await request(app)
+      .post('/api/v1/auth/login')
+      .send({ username: adminBUsername, password: adminBPass });
+    const adminBCookie = adminBLoginRes.headers['set-cookie'].find(c => c.startsWith('rifad_session=')).split(';')[0];
+
+    const crossSchoolPatchRes = await request(app)
+      .patch(`/api/v1/teachers/${teacher1.id}`)
+      .set('Cookie', adminBCookie)
+      .send({ nationality: 'test' });
+    assert(crossSchoolPatchRes.status === 403, 'School B admin cannot PATCH School A teacher (403 Forbidden) — cross-school guard unchanged');
+    assert(crossSchoolPatchRes.body.error.code === 'FORBIDDEN_SCOPE_VIOLATION', 'Returns FORBIDDEN_SCOPE_VIOLATION');
+
+    const crossSchoolStatusRes = await request(app)
+      .patch(`/api/v1/teachers/${teacher1.id}/status`)
+      .set('Cookie', adminBCookie)
+      .send({ status: 'ON_LEAVE' });
+    assert(crossSchoolStatusRes.status === 403, 'School B admin cannot PATCH School A teacher status (403 Forbidden) — cross-school guard unchanged');
 
     // ----------------------------------------------------
     // TEST: Link Teacher Subject (تأهيل المادة)

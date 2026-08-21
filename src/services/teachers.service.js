@@ -257,6 +257,7 @@ class TeachersService {
     callerUser,
     callerScopes,
     isPlatformLevel,
+    callerPermissions = [],
     data,
     context = {}
   }) {
@@ -376,14 +377,17 @@ class TeachersService {
       return created;
     });
 
+    // RIFAD-GAP-002: pass through the caller's REAL permissions (no hardcoded bypass).
+    // Whether plaintext sensitive PII is visible in this response is governed by the
+    // same rule as every other teacher read path (isPlatformLevel / teachers.view_sensitive).
     return await this.getTeacherById(teacher.id, {
       callerScopes,
       isPlatformLevel,
-      callerPermissions: ['teachers.view_sensitive']
+      callerPermissions
     });
   }
 
-  static async updateTeacher(id, { callerUser, callerScopes, isPlatformLevel, data, context = {} }) {
+  static async updateTeacher(id, { callerUser, callerScopes, isPlatformLevel, callerPermissions = [], data, context = {} }) {
     const existing = await prisma.teacher.findFirst({ where: { id, deletedAt: null } });
     if (!existing) throw new AppError('المعلم غير موجود', 404, ERROR_CODES.NOT_FOUND);
 
@@ -437,10 +441,14 @@ class TeachersService {
       return res;
     });
 
-    return updated;
+    // RIFAD-GAP-001: never return the raw Prisma row (nationalIdEncrypted, phoneEncrypted,
+    // emailEncrypted, nationalIdHash, phoneHash, emailHash). Apply the same formatter/masking
+    // used by every other teacher read path (getTeacherById / listTeachers).
+    const hasSensitivePerm = isPlatformLevel || callerPermissions.includes('teachers.view_sensitive') || callerPermissions.includes('*');
+    return this.formatTeacher(updated, hasSensitivePerm);
   }
 
-  static async updateTeacherStatus(id, { callerUser, callerScopes, isPlatformLevel, status, context = {} }) {
+  static async updateTeacherStatus(id, { callerUser, callerScopes, isPlatformLevel, callerPermissions = [], status, context = {} }) {
     const validStatuses = ['ACTIVE', 'ON_LEAVE', 'RESIGNED', 'TERMINATED'];
     if (!validStatuses.includes(status)) {
       throw new AppError('حالة المعلم غير صالحة', 400, ERROR_CODES.VALIDATION_ERROR);
@@ -475,7 +483,9 @@ class TeachersService {
       return res;
     });
 
-    return updated;
+    // RIFAD-GAP-001: same formatter/masking as updateTeacher — never return the raw row.
+    const hasSensitivePerm = isPlatformLevel || callerPermissions.includes('teachers.view_sensitive') || callerPermissions.includes('*');
+    return this.formatTeacher(updated, hasSensitivePerm);
   }
 
   static async deleteTeacher(id, { callerUser, callerScopes, isPlatformLevel, context = {} }) {
