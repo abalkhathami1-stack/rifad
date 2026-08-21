@@ -50,6 +50,9 @@ export function MainLayout() {
         if (pathname.startsWith('/promotion/')) {
           return 'تفاصيل دفعة الترفيع والقرارات';
         }
+        if (pathname.startsWith('/users/')) {
+          return 'الملف التفصيلي للمستخدم';
+        }
         return 'منصة رِفاد';
     }
   };

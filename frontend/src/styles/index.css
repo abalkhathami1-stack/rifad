@@ -8,6 +8,7 @@
 @import './academic.css';
 @import './import.css';
 @import './promotion.css';
+@import './users.css';
 
 /* CSS Reset & Box Sizing */
 *, *::before, *::after {

@@ -5,7 +5,6 @@ import { MainLayout } from '../layouts/MainLayout';
 import { ProtectedRoute } from './ProtectedRoute';
 import { LoginPage } from '../pages/LoginPage';
 import { DashboardPage } from '../pages/DashboardPage';
-import { PlaceholderPage } from '../pages/PlaceholderPage';
 import { StudentsPage } from '../pages/StudentsPage';
 import { StudentDetailsPage } from '../pages/StudentDetailsPage';
 import { TeachersPage } from '../pages/TeachersPage';
@@ -22,6 +21,8 @@ import { ImportPage } from '../pages/ImportPage';
 import { ImportBatchPage } from '../pages/ImportBatchPage';
 import { PromotionPage } from '../pages/PromotionPage';
 import { PromotionBatchPage } from '../pages/PromotionBatchPage';
+import { UsersPage } from '../pages/UsersPage';
+import { UserDetailsPage } from '../pages/UserDetailsPage';
 import { NotFoundPage } from '../pages/NotFoundPage';
 import { PERMISSIONS } from '../constants/permissions';
 
@@ -38,7 +39,7 @@ export function AppRoutes() {
         <Route element={<MainLayout />}>
           {/* Default redirect to Dashboard */}
           <Route path="/" element={<Navigate to="/dashboard" replace />} />
-          
+
           {/* Main Dashboard */}
           <Route path="/dashboard" element={<DashboardPage />} />
 
@@ -82,17 +83,10 @@ export function AppRoutes() {
             <Route path="/promotion/:batchId" element={<PromotionBatchPage />} />
           </Route>
 
+          {/* Users & Roles Management Domain Routes (Protected by USERS_VIEW) */}
           <Route element={<ProtectedRoute requiredPermission={PERMISSIONS.USERS_VIEW} />}>
-            <Route
-              path="/users"
-              element={
-                <PlaceholderPage
-                  title="إدارة المستخدمين والصلاحيات"
-                  description="إدارة حسابات المستخدمين، إسناد الأدوار، وتحديد النطاقات الإدارية."
-                  icon="👥"
-                />
-              }
-            />
+            <Route path="/users" element={<UsersPage />} />
+            <Route path="/users/:id" element={<UserDetailsPage />} />
           </Route>
         </Route>
       </Route>

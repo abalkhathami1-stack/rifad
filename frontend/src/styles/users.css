@@ -1,0 +1,249 @@
+/* Users & Roles Management Domain Styles (Phase 2.7) */
+
+/* ── Action Buttons ──────────────────────────────────────────────
+   Distinct class names on purpose: the codebase has no generic .btn /
+   .btn-secondary anywhere, and .btn-primary (auth.css) is width:100%
+   and scoped to the login form — reusing it here would both look wrong
+   (stretched buttons in a table header / modal footer) and risk
+   regressions on the Login page if its rules are ever adjusted. */
+.btn-action-primary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-3) var(--spacing-5);
+  background-color: var(--color-primary);
+  color: var(--color-text-on-primary);
+  border: 1px solid var(--color-primary);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  cursor: pointer;
+  transition: background-color var(--transition-fast), transform 50ms ease;
+  white-space: nowrap;
+}
+
+.btn-action-primary:hover:not(:disabled) {
+  background-color: var(--color-primary-hover);
+}
+
+.btn-action-primary:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+.btn-action-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.btn-action-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-3) var(--spacing-5);
+  background-color: var(--color-surface);
+  color: var(--color-text-main);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  white-space: nowrap;
+}
+
+.btn-action-secondary:hover:not(:disabled) {
+  background-color: var(--color-surface-hover);
+}
+
+.btn-action-secondary:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn-action-danger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-2);
+  padding: var(--spacing-2) var(--spacing-4);
+  background-color: var(--color-surface);
+  color: var(--color-error);
+  border: 1px solid var(--color-error-border);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  white-space: nowrap;
+}
+
+.btn-action-danger:hover:not(:disabled) {
+  background-color: var(--color-error-bg);
+}
+
+.btn-action-danger:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.btn-action-sm {
+  padding: var(--spacing-2) var(--spacing-4);
+  font-size: var(--font-size-xs);
+}
+
+/* ── User Hero Card (User Details header) ────────────────────── */
+.user-hero-card {
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--spacing-6);
+  margin-bottom: var(--spacing-6);
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--spacing-4);
+}
+
+.user-hero-identity {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-4);
+}
+
+.user-hero-avatar {
+  width: 60px;
+  height: 60px;
+  background-color: var(--color-primary);
+  color: var(--color-text-on-primary);
+  border-radius: var(--radius-lg);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--font-size-2xl);
+  font-weight: 800;
+  flex-shrink: 0;
+}
+
+.user-hero-details {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.user-hero-name {
+  font-size: var(--font-size-xl);
+  font-weight: 800;
+  color: var(--color-text-main);
+}
+
+.user-hero-sub {
+  font-size: var(--font-size-sm);
+  color: var(--color-text-muted);
+}
+
+.user-hero-badges {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  flex-wrap: wrap;
+  margin-top: var(--spacing-1);
+}
+
+.user-hero-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2);
+  flex-wrap: wrap;
+}
+
+/* ── Role Assignment Cards ───────────────────────────────────── */
+.role-assignment-card {
+  background-color: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-lg);
+  padding: var(--spacing-4);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-3);
+  margin-bottom: var(--spacing-3);
+}
+
+.role-assignment-card:last-child {
+  margin-bottom: 0;
+}
+
+.role-assignment-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.role-assignment-scope {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-secondary);
+}
+
+.role-assignment-locked-note {
+  font-size: var(--font-size-xs);
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
+/* ── Sensitive Action Confirmation ───────────────────────────── */
+.action-warning-box {
+  background-color: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-3) var(--spacing-4);
+  margin-bottom: var(--spacing-4);
+  font-size: var(--font-size-sm);
+  color: var(--color-warning);
+  line-height: 1.6;
+}
+
+.action-info-box {
+  background-color: var(--color-info-bg);
+  border: 1px solid var(--color-info-border);
+  border-radius: var(--radius-md);
+  padding: var(--spacing-3) var(--spacing-4);
+  margin-bottom: var(--spacing-4);
+  font-size: var(--font-size-xs);
+  color: var(--color-info);
+  line-height: 1.6;
+}
+
+/* ── Section Headers within User Details ─────────────────────── */
+.user-section-header {
+  padding: var(--spacing-4) var(--spacing-5);
+  border-bottom: 1px solid var(--color-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--spacing-3);
+}
+
+.user-section-title {
+  font-size: var(--font-size-base);
+  font-weight: 700;
+  color: var(--color-primary);
+}
+
+/* ── Modal form spacing (reuses .form-group / .form-label / .form-input
+   from auth.css; this only governs layout within a two-column modal body) */
+.modal-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--spacing-4);
+}
+
+@media (max-width: 560px) {
+  .modal-form-grid {
+    grid-template-columns: 1fr;
+  }
+}
