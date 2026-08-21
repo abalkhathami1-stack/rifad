@@ -587,7 +587,16 @@ class ImportService {
         uploadedBy: { select: { id: true, username: true, fullName: true } },
         records: {
           orderBy: { rowNumber: 'asc' },
-          take: 50
+          take: 50,
+          // RIFAD-GAP-009: explicit field allowlist — never select rawData (raw import PII)
+          // into the preview response. Only non-sensitive validation-state metadata is needed
+          // here; the actual record content is only handled server-side during commit.
+          select: {
+            id: true,
+            rowNumber: true,
+            entityType: true,
+            status: true
+          }
         },
         errors: {
           orderBy: { rowNumber: 'asc' },

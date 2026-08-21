@@ -343,6 +343,46 @@ async function runImportProductionTestSuite() {
     assert(validateTchRes.status === 200, 'Teacher validation passed (200 OK)');
     assert(validateTchRes.body.data.status === 'VALIDATED', 'Teacher batch is VALIDATED');
 
+    // ----------------------------------------------------
+    // TEST 10b: RIFAD-GAP-009 Regression — Batch Preview Must Not Leak Raw PII
+    // ----------------------------------------------------
+    console.log('\n--- 13b. RIFAD-GAP-009 Regression: Batch Preview Must Not Expose Raw PII ---');
+    const NATIONAL_ID_SENTINEL = '1098765432';
+    const PHONE_SENTINEL = '0551234567';
+    const EMAIL_SENTINEL = 'ahmed.zahrani@school.edu.sa';
+
+    // A. Authorized caller (import.view) still gets a successful preview as before
+    const tchPreviewRes = await request(app)
+      .get(`/api/v1/import/batches/${tchBatchId}/preview`)
+      .set('Cookie', adminCookie);
+
+    assert(tchPreviewRes.status === 200, 'Authorized caller (import.view) still retrieves batch preview (200 OK)');
+    assert(tchPreviewRes.body.data.previewRecords.length === 1, 'Preview still contains 1 teacher record');
+
+    // B. Response does NOT contain rawData / raw_data at all
+    const previewRecord = tchPreviewRes.body.data.previewRecords[0];
+    assert(!Object.prototype.hasOwnProperty.call(previewRecord, 'rawData'), 'Preview record does not contain rawData field');
+    assert(!Object.prototype.hasOwnProperty.call(previewRecord, 'raw_data'), 'Preview record does not contain raw_data field');
+
+    // C. Recursive serialization check — no sentinel PII value anywhere in the full response body
+    const previewBodyText = JSON.stringify(tchPreviewRes.body);
+    assert(!previewBodyText.includes(NATIONAL_ID_SENTINEL), 'Preview response does not leak sentinel national ID anywhere in the payload');
+    assert(!previewBodyText.includes(PHONE_SENTINEL), 'Preview response does not leak sentinel phone number anywhere in the payload');
+    assert(!previewBodyText.includes(EMAIL_SENTINEL), 'Preview response does not leak sentinel email anywhere in the payload');
+    assert(!previewBodyText.toLowerCase().includes('rawdata') && !previewBodyText.includes('raw_data'), 'Preview response contains no rawData/raw_data key anywhere');
+
+    // D. Existing non-sensitive preview metadata still present as expected
+    assert(
+      Boolean(previewRecord.id) && previewRecord.rowNumber === 1 && Boolean(previewRecord.status) && previewRecord.entityType === 'TEACHERS',
+      'Preview record still exposes non-sensitive metadata (id, rowNumber, status, entityType)'
+    );
+    assert(tchPreviewRes.body.data.isCommitEligible === true, 'isCommitEligible metadata unaffected by the fix');
+
+    // E. Unauthorized behavior remains unchanged (auth/permission model untouched by this fix)
+    const noAuthPreviewRes = await request(app)
+      .get(`/api/v1/import/batches/${tchBatchId}/preview`);
+    assert(noAuthPreviewRes.status === 401, 'Unauthenticated preview request still rejected (401) — auth model unchanged');
+
     const commitTchRes = await request(app)
       .post(`/api/v1/import/batches/${tchBatchId}/commit`)
       .set('Cookie', adminCookie);
