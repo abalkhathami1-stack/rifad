@@ -21,6 +21,20 @@ export const SCOPE_TYPE_LABELS_AR = {
   SECTION: 'نطاق القسم التعليمي'
 };
 
+/** SchoolSection.genderType (prisma/schema.prisma: SchoolSectionGender) — used
+ * only to disambiguate sections with the same name in a selector. */
+export const SCHOOL_SECTION_GENDER_LABELS_AR = {
+  BOYS: 'بنين',
+  GIRLS: 'بنات',
+  MIXED: 'مختلط'
+};
+
+/** Formats a SchoolSectionGender enum value into its Arabic label. */
+export function formatSchoolSectionGender(genderType) {
+  if (!genderType || typeof genderType !== 'string') return '';
+  return SCHOOL_SECTION_GENDER_LABELS_AR[genderType] || genderType;
+}
+
 /** Formats a UserStatus enum value into its Arabic label. Never renders raw "undefined". */
 export function formatUserStatus(status) {
   if (!status || typeof status !== 'string') return 'غير محدد';

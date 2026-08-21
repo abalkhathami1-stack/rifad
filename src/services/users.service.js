@@ -4,6 +4,79 @@ const AppError = require('../utils/app-error.util');
 const { ERROR_CODES } = require('../constants/error-codes');
 const AuditService = require('./audit.service');
 
+// RFC 4122-shaped UUID check. No project-wide UUID validator exists yet
+// (checked src/utils/*) — kept intentionally minimal and local to this file
+// rather than introducing a new validation utility/framework.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function isValidUuid(value) {
+  return typeof value === 'string' && UUID_PATTERN.test(value);
+}
+
+/**
+ * Enforces the PLATFORM / SCHOOL / SECTION role-assignment scope contract,
+ * server-side, for any caller — shared by createUser's initial role
+ * assignment and assignRole. This is a cheap, synchronous shape check only
+ * (no DB access): it rejects structurally invalid combinations before any
+ * query runs. The actual SchoolSection existence/ownership check for
+ * SECTION scope happens separately, inside the same transaction as the
+ * write it guards (see createUser / assignRole).
+ *
+ * Rules (Backend is the sole boundary — Frontend validation is UX only):
+ *   PLATFORM -> schoolId and sectionDivisionId must both be absent.
+ *   SCHOOL   -> schoolId required; sectionDivisionId must be absent.
+ *   SECTION  -> schoolId required; sectionDivisionId required and must be a
+ *               syntactically valid UUID (existence/ownership verified later).
+ */
+const VALID_SCOPE_TYPES = ['PLATFORM', 'SCHOOL', 'SECTION'];
+
+function validateScopeShape({ scopeType, schoolId, sectionDivisionId }) {
+  if (!VALID_SCOPE_TYPES.includes(scopeType)) {
+    // Rejected here so an unrecognized value never reaches Prisma: the
+    // scopeType column is a Postgres/Prisma enum, and an invalid enum value
+    // throws a PrismaClientValidationError — which is not an AppError and
+    // not P2002/P2025, so it would otherwise fall through to the generic
+    // "unhandled error" branch in error.middleware.js (raw message/stack in
+    // non-production).
+    throw new AppError('نطاق الدور (scopeType) غير صالح', 400, ERROR_CODES.VALIDATION_ERROR);
+  }
+
+  if (scopeType === 'PLATFORM') {
+    if (schoolId) {
+      throw new AppError('نطاق PLATFORM لا يقبل تحديد مدرسة (schoolId)', 400, ERROR_CODES.VALIDATION_ERROR);
+    }
+    if (sectionDivisionId) {
+      throw new AppError('نطاق PLATFORM لا يقبل تحديد قسم تعليمي (sectionDivisionId)', 400, ERROR_CODES.VALIDATION_ERROR);
+    }
+    return;
+  }
+
+  if (scopeType === 'SCHOOL') {
+    if (!schoolId) {
+      throw new AppError('يجب تحديد المدرسة (schoolId) لنطاق SCHOOL', 400, ERROR_CODES.VALIDATION_ERROR);
+    }
+    if (sectionDivisionId) {
+      throw new AppError('نطاق SCHOOL لا يقبل تحديد قسم تعليمي (sectionDivisionId)', 400, ERROR_CODES.VALIDATION_ERROR);
+    }
+    return;
+  }
+
+  if (scopeType === 'SECTION') {
+    if (!schoolId) {
+      throw new AppError('يجب تحديد المدرسة (schoolId) لنطاق SECTION', 400, ERROR_CODES.VALIDATION_ERROR);
+    }
+    // Same generic message for "missing", "malformed", "not found", and
+    // "belongs to another school" — deliberately: distinguishing them would
+    // leak whether a given ID exists elsewhere in the system. The malformed-
+    // UUID case is rejected right here, before any Prisma query runs, so an
+    // invalid sectionDivisionId can never reach the database and trigger a
+    // raw Prisma/foreign-key error.
+    if (!sectionDivisionId || !isValidUuid(sectionDivisionId)) {
+      throw new AppError('القسم التعليمي المحدد غير موجود أو لا ينتمي إلى المدرسة المحددة', 400, ERROR_CODES.VALIDATION_ERROR);
+    }
+  }
+}
+
 const USER_SELECT_FIELDS = {
   id: true,
   username: true,
@@ -171,6 +244,10 @@ class UsersService {
       throw new AppError('اسم المستخدم، كلمة المرور، والاسم الكامل حقول إجبارية', 400, ERROR_CODES.VALIDATION_ERROR);
     }
 
+    if (typeof password !== 'string' || password.length < 8) {
+      throw new AppError('كلمة المرور يجب ألا تقل عن 8 خانات', 400, ERROR_CODES.VALIDATION_ERROR);
+    }
+
     // Check duplicate username
     const existing = await prisma.user.findFirst({
       where: { username: username.trim(), deletedAt: null }
@@ -204,6 +281,23 @@ class UsersService {
       }
     }
 
+    // Resolve the actual scope this initial role assignment will use (same
+    // defaulting the write below already applies) and validate its shape
+    // server-side — independent of whatever the Frontend sends. Validation
+    // runs against the RAW schoolId/sectionDivisionId (before any nulling),
+    // so an extraneous field for the resolved scope (e.g. sectionDivisionId
+    // sent alongside a SCHOOL-scope role) is explicitly rejected instead of
+    // being silently dropped.
+    let effectiveScopeType = null;
+    let effectiveSchoolId = null;
+    let effectiveSectionDivisionId = null;
+    if (roleCode) {
+      effectiveScopeType = scopeType || (roleCode === 'PLATFORM_OWNER' ? 'PLATFORM' : 'SCHOOL');
+      validateScopeShape({ scopeType: effectiveScopeType, schoolId, sectionDivisionId });
+      effectiveSchoolId = effectiveScopeType === 'PLATFORM' ? null : schoolId;
+      effectiveSectionDivisionId = effectiveScopeType === 'SECTION' ? sectionDivisionId : null;
+    }
+
     // Hash password with Argon2id
     const passwordHash = await argon2.hash(password, {
       type: argon2.argon2id,
@@ -232,13 +326,24 @@ class UsersService {
           throw new AppError(`الدور [${roleCode}] غير معرف في النظام`, 400, ERROR_CODES.BAD_REQUEST);
         }
 
+        // SECTION-scope existence/ownership check runs inside this same
+        // transaction, right before the write it guards (see Gap Report).
+        if (effectiveScopeType === 'SECTION') {
+          const section = await tx.schoolSection.findFirst({
+            where: { id: effectiveSectionDivisionId, schoolId: effectiveSchoolId, deletedAt: null }
+          });
+          if (!section) {
+            throw new AppError('القسم التعليمي المحدد غير موجود أو لا ينتمي إلى المدرسة المحددة', 400, ERROR_CODES.VALIDATION_ERROR);
+          }
+        }
+
         roleAssignment = await tx.userRoleAssignment.create({
           data: {
             userId: user.id,
             roleId: role.id,
-            scopeType: scopeType || (roleCode === 'PLATFORM_OWNER' ? 'PLATFORM' : 'SCHOOL'),
-            schoolId: scopeType === 'PLATFORM' ? null : schoolId,
-            sectionDivisionId: sectionDivisionId || null
+            scopeType: effectiveScopeType,
+            schoolId: effectiveSchoolId,
+            sectionDivisionId: effectiveSectionDivisionId
           }
         });
       }
@@ -467,14 +572,24 @@ class UsersService {
       }
     }
 
+    // Resolve the actual scope this assignment will use and validate its
+    // shape server-side — independent of whatever the Frontend sends.
+    // Validation runs against the RAW schoolId/sectionDivisionId (before any
+    // nulling), so an extraneous field for this scopeType (e.g. sectionDivisionId
+    // sent alongside SCHOOL/PLATFORM) is explicitly rejected instead of being
+    // silently dropped.
+    validateScopeShape({ scopeType, schoolId, sectionDivisionId });
+    const effectiveSchoolId = scopeType === 'PLATFORM' ? null : schoolId;
+    const effectiveSectionDivisionId = scopeType === 'SECTION' ? sectionDivisionId : null;
+
     // 3. Duplicate check
     const existing = await prisma.userRoleAssignment.findFirst({
       where: {
         userId,
         roleId: role.id,
         scopeType,
-        schoolId: scopeType === 'PLATFORM' ? null : schoolId,
-        sectionDivisionId: sectionDivisionId || null
+        schoolId: effectiveSchoolId,
+        sectionDivisionId: effectiveSectionDivisionId
       }
     });
 
@@ -489,13 +604,24 @@ class UsersService {
     const isSelfModification = callerUser.id === userId;
 
     const assignment = await prisma.$transaction(async (tx) => {
+      // SECTION-scope existence/ownership check runs inside this same
+      // transaction, right before the write it guards (see Gap Report).
+      if (scopeType === 'SECTION') {
+        const section = await tx.schoolSection.findFirst({
+          where: { id: effectiveSectionDivisionId, schoolId: effectiveSchoolId, deletedAt: null }
+        });
+        if (!section) {
+          throw new AppError('القسم التعليمي المحدد غير موجود أو لا ينتمي إلى المدرسة المحددة', 400, ERROR_CODES.VALIDATION_ERROR);
+        }
+      }
+
       const created = await tx.userRoleAssignment.create({
         data: {
           userId,
           roleId: role.id,
           scopeType,
-          schoolId: scopeType === 'PLATFORM' ? null : schoolId,
-          sectionDivisionId: sectionDivisionId || null
+          schoolId: effectiveSchoolId,
+          sectionDivisionId: effectiveSectionDivisionId
         },
         include: {
           role: true,

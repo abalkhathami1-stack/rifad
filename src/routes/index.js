@@ -1,6 +1,7 @@
 const express = require('express');
 const authRoutes = require('./auth.routes');
 const usersRoutes = require('./users.routes');
+const schoolsRoutes = require('./schools.routes');
 const academicRoutes = require('./academic.routes');
 const studentsRoutes = require('./students.routes');
 const teachersRoutes = require('./teachers.routes');
@@ -24,6 +25,7 @@ router.get('/health', (req, res) => {
 // Modular Domain Routes
 router.use('/auth', authRoutes);
 router.use('/users', usersRoutes);
+router.use('/schools', schoolsRoutes);
 router.use('/academic', academicRoutes);
 router.use('/students', studentsRoutes);
 router.use('/teachers', teachersRoutes);

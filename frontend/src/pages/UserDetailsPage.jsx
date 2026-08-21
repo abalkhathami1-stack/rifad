@@ -1,10 +1,12 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { UsersApi } from '../api/users.api';
+import { SchoolsApi } from '../api/schools.api';
+import { AcademicApi } from '../api/academic.api';
 import { useAuth } from '../context/AuthContext';
 import { PERMISSIONS } from '../constants/permissions';
 import { ROLE_LABELS_AR, formatRoleLabel } from '../utils/roleLabels';
-import { formatUserStatus, formatScopeType, getUserStatusBadgeClass } from '../utils/userStatus';
+import { formatUserStatus, formatScopeType, getUserStatusBadgeClass, formatSchoolSectionGender } from '../utils/userStatus';
 import { LoadingSpinner } from '../components/LoadingSpinner';
 import { Alert } from '../components/Alert';
 
@@ -50,9 +52,15 @@ export function UserDetailsPage() {
 
   const [showAssignRoleModal, setShowAssignRoleModal] = useState(false);
   const [assignRoleCode, setAssignRoleCode] = useState('');
+  const [assignScopeKind, setAssignScopeKind] = useState('SCHOOL'); // 'SCHOOL' | 'SECTION' — only relevant when a non-PLATFORM_OWNER role is selected
   const [assignSchoolId, setAssignSchoolId] = useState('');
+  const [assignSectionDivisionId, setAssignSectionDivisionId] = useState('');
   const [myScopedSchools, setMyScopedSchools] = useState([]);
   const [isLoadingSchools, setIsLoadingSchools] = useState(false);
+  const [assignSections, setAssignSections] = useState([]);
+  const [isLoadingAssignSections, setIsLoadingAssignSections] = useState(false);
+  const [assignSectionsError, setAssignSectionsError] = useState(null);
+  const assignSectionsAbortRef = useRef(null);
   const [isAssigningRole, setIsAssigningRole] = useState(false);
   const [assignRoleError, setAssignRoleError] = useState(null);
 
@@ -180,30 +188,98 @@ export function UserDetailsPage() {
   // ─── Assign Role ─────────────────────────────────────────────────
   const handleOpenAssignRole = async () => {
     setAssignRoleCode('');
+    setAssignScopeKind('SCHOOL');
     setAssignSchoolId('');
+    setAssignSectionDivisionId('');
+    setAssignSections([]);
+    setAssignSectionsError(null);
     setAssignRoleError(null);
     setShowAssignRoleModal(true);
 
-    if (!isPlatformLevel && currentUser?.id) {
-      setIsLoadingSchools(true);
-      try {
-        const schools = await UsersApi.getMyScopedSchools(currentUser.id);
-        setMyScopedSchools(schools);
-        if (schools.length === 1) setAssignSchoolId(schools[0].id);
-      } catch {
-        setMyScopedSchools([]);
-      } finally {
-        setIsLoadingSchools(false);
-      }
-    } else {
+    setIsLoadingSchools(true);
+    try {
+      const data = await SchoolsApi.listSchools();
+      const schools = data?.schools || [];
+      setMyScopedSchools(schools);
+      if (!isPlatformLevel && schools.length === 1) setAssignSchoolId(schools[0].id);
+    } catch {
       setMyScopedSchools([]);
+    } finally {
+      setIsLoadingSchools(false);
     }
   };
+
+  const handleCloseAssignRole = () => {
+    if (assignSectionsAbortRef.current) assignSectionsAbortRef.current.abort();
+    setShowAssignRoleModal(false);
+  };
+
+  // Loads the SchoolSection catalog for a given school (GET /api/v1/academic/sections?schoolId=X).
+  // Used only when assignScopeKind === 'SECTION'. Cancels any still-in-flight request
+  // for a previous school before starting a new one.
+  const loadSectionsForAssign = async (schoolIdValue) => {
+    if (assignSectionsAbortRef.current) assignSectionsAbortRef.current.abort();
+    if (!schoolIdValue) {
+      setAssignSections([]);
+      setAssignSectionsError(null);
+      return;
+    }
+    const controller = new AbortController();
+    assignSectionsAbortRef.current = controller;
+    setIsLoadingAssignSections(true);
+    setAssignSectionsError(null);
+    try {
+      const data = await AcademicApi.listSections({ schoolId: schoolIdValue }, controller.signal);
+      setAssignSections(data?.sections || []);
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        setAssignSectionsError(err.message || 'تعذر تحميل الأقسام التعليمية لهذه المدرسة.');
+        setAssignSections([]);
+      }
+    } finally {
+      setIsLoadingAssignSections(false);
+    }
+  };
+
+  // A new school selection always invalidates any previously chosen section —
+  // a section from the old school must never survive into the new selection.
+  const handleAssignSchoolChange = (schoolIdValue) => {
+    setAssignSchoolId(schoolIdValue);
+    setAssignSectionDivisionId('');
+    if (assignScopeKind === 'SECTION') {
+      loadSectionsForAssign(schoolIdValue);
+    }
+  };
+
+  const handleAssignScopeKindChange = (kind) => {
+    setAssignScopeKind(kind);
+    setAssignSectionDivisionId('');
+    if (kind === 'SECTION' && assignSchoolId) {
+      loadSectionsForAssign(assignSchoolId);
+    } else {
+      if (assignSectionsAbortRef.current) assignSectionsAbortRef.current.abort();
+      setAssignSections([]);
+      setAssignSectionsError(null);
+    }
+  };
+
+  const isAssignScopeIncomplete =
+    Boolean(assignRoleCode) &&
+    assignRoleCode !== 'PLATFORM_OWNER' &&
+    (!assignSchoolId ||
+      (assignScopeKind === 'SECTION' &&
+        (isLoadingAssignSections || Boolean(assignSectionsError) || !assignSectionDivisionId)));
 
   const handleAssignRole = async (e) => {
     e.preventDefault();
     if (!assignRoleCode) { setAssignRoleError('يجب اختيار الدور المطلوب إسناده.'); return; }
-    if (!isPlatformLevel && !assignSchoolId) { setAssignRoleError('يجب تحديد المدرسة.'); return; }
+    if (assignRoleCode !== 'PLATFORM_OWNER') {
+      if (!assignSchoolId) { setAssignRoleError('يجب تحديد المدرسة.'); return; }
+      if (assignScopeKind === 'SECTION' && !assignSectionDivisionId) {
+        setAssignRoleError('يجب تحديد القسم التعليمي عند اختيار نطاق قسم محدد.');
+        return;
+      }
+    }
 
     setIsAssigningRole(true);
     setAssignRoleError(null);
@@ -211,9 +287,13 @@ export function UserDetailsPage() {
       const payload = { roleCode: assignRoleCode };
       if (assignRoleCode === 'PLATFORM_OWNER') {
         payload.scopeType = 'PLATFORM';
+      } else if (assignScopeKind === 'SECTION') {
+        payload.scopeType = 'SECTION';
+        payload.schoolId = assignSchoolId;
+        payload.sectionDivisionId = assignSectionDivisionId;
       } else {
         payload.scopeType = 'SCHOOL';
-        payload.schoolId = isPlatformLevel ? undefined : assignSchoolId;
+        payload.schoolId = assignSchoolId;
       }
       await UsersApi.assignRole(id, payload);
       setShowAssignRoleModal(false);
@@ -496,7 +576,7 @@ export function UserDetailsPage() {
           <div className="modal-content" style={{ maxWidth: '520px' }}>
             <div className="modal-header">
               <h4 className="modal-title">إسناد دور جديد للمستخدم</h4>
-              <button type="button" className="back-link-btn" style={{ margin: 0 }} onClick={() => setShowAssignRoleModal(false)} disabled={isAssigningRole}>✕</button>
+              <button type="button" className="back-link-btn" style={{ margin: 0 }} onClick={handleCloseAssignRole} disabled={isAssigningRole}>✕</button>
             </div>
             <form onSubmit={handleAssignRole}>
               <div className="modal-body">
@@ -513,24 +593,69 @@ export function UserDetailsPage() {
                   </select>
                 </div>
 
-                {assignRoleCode && !isPlatformLevel && (
-                  <div className="form-group">
-                    <label className="form-label">المدرسة *</label>
-                    {isLoadingSchools ? (
-                      <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--color-text-muted)' }}>جاري التحميل...</span>
-                    ) : myScopedSchools.length === 0 ? (
-                      <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--color-error)' }}>لا توجد مدرسة مرتبطة بحسابك.</span>
-                    ) : myScopedSchools.length === 1 ? (
-                      <span style={{ fontSize: 'var(--font-size-sm)', fontWeight: 600 }}>{myScopedSchools[0].nameAr}</span>
-                    ) : (
-                      <select className="filter-select" style={{ width: '100%' }} value={assignSchoolId} onChange={(e) => setAssignSchoolId(e.target.value)} required>
-                        <option value="">-- اختر المدرسة --</option>
-                        {myScopedSchools.map((s) => (
-                          <option key={s.id} value={s.id}>{s.nameAr}</option>
-                        ))}
+                {assignRoleCode && assignRoleCode !== 'PLATFORM_OWNER' && (
+                  <>
+                    <div className="form-group" style={{ marginBottom: 'var(--spacing-4)' }}>
+                      <label className="form-label">نطاق الإسناد *</label>
+                      <select
+                        className="filter-select"
+                        style={{ width: '100%' }}
+                        value={assignScopeKind}
+                        onChange={(e) => handleAssignScopeKindChange(e.target.value)}
+                      >
+                        <option value="SCHOOL">المدرسة بالكامل</option>
+                        <option value="SECTION">قسم تعليمي محدد داخل المدرسة</option>
                       </select>
-                    )}
-                  </div>
+                    </div>
+
+                    <div className="modal-form-grid">
+                      <div className="form-group">
+                        <label className="form-label">المدرسة *</label>
+                        {isLoadingSchools ? (
+                          <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--color-text-muted)' }}>جاري التحميل...</span>
+                        ) : myScopedSchools.length === 0 ? (
+                          <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--color-error)' }}>
+                            {isPlatformLevel ? 'لا توجد مدارس مسجلة في النظام.' : 'لا توجد مدرسة مرتبطة بحسابك.'}
+                          </span>
+                        ) : !isPlatformLevel && myScopedSchools.length === 1 ? (
+                          <span style={{ fontSize: 'var(--font-size-sm)', fontWeight: 600 }}>{myScopedSchools[0].nameAr}</span>
+                        ) : (
+                          <select className="filter-select" style={{ width: '100%' }} value={assignSchoolId} onChange={(e) => handleAssignSchoolChange(e.target.value)} required>
+                            <option value="">-- اختر المدرسة --</option>
+                            {myScopedSchools.map((s) => (
+                              <option key={s.id} value={s.id} disabled={s.isActive === false}>
+                                {s.nameAr}{s.isActive === false ? ' (غير نشطة)' : ''}
+                              </option>
+                            ))}
+                          </select>
+                        )}
+                      </div>
+
+                      {assignScopeKind === 'SECTION' && (
+                        <div className="form-group">
+                          <label className="form-label">القسم التعليمي *</label>
+                          {!assignSchoolId ? (
+                            <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--color-text-muted)' }}>اختر المدرسة أولاً</span>
+                          ) : isLoadingAssignSections ? (
+                            <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--color-text-muted)' }}>جاري تحميل الأقسام...</span>
+                          ) : assignSectionsError ? (
+                            <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--color-error)' }}>{assignSectionsError}</span>
+                          ) : assignSections.length === 0 ? (
+                            <span style={{ fontSize: 'var(--font-size-xs)', color: 'var(--color-error)' }}>لا توجد أقسام تعليمية مسجلة لهذه المدرسة.</span>
+                          ) : (
+                            <select className="filter-select" style={{ width: '100%' }} value={assignSectionDivisionId} onChange={(e) => setAssignSectionDivisionId(e.target.value)} required>
+                              <option value="">-- اختر القسم --</option>
+                              {assignSections.map((s) => (
+                                <option key={s.id} value={s.id}>
+                                  {s.nameAr}{s.genderType ? ` (${formatSchoolSectionGender(s.genderType)})` : ''}
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </>
                 )}
 
                 {assignRoleCode === 'PLATFORM_OWNER' && isPlatformLevel && (
@@ -538,16 +663,10 @@ export function UserDetailsPage() {
                     ⚠️ سيتم منح هذا المستخدم صلاحيات مالك المنصة الكاملة.
                   </div>
                 )}
-
-                {assignRoleCode && isPlatformLevel && assignRoleCode !== 'PLATFORM_OWNER' && (
-                  <div className="action-info-box" style={{ marginTop: 'var(--spacing-4)', marginBottom: 0 }}>
-                    ℹ️ إسناد دور بنطاق مدرسة محددة من حساب مستوى المنصة غير متاح حالياً في هذه الشاشة (بانتظار آلية رسمية لاختيار المدرسة).
-                  </div>
-                )}
               </div>
               <div className="modal-actions">
-                <button type="button" className="btn-action-secondary" onClick={() => setShowAssignRoleModal(false)} disabled={isAssigningRole}>إلغاء</button>
-                <button type="submit" className="btn-action-primary" disabled={isAssigningRole || (assignRoleCode && isPlatformLevel && assignRoleCode !== 'PLATFORM_OWNER')}>
+                <button type="button" className="btn-action-secondary" onClick={handleCloseAssignRole} disabled={isAssigningRole}>إلغاء</button>
+                <button type="submit" className="btn-action-primary" disabled={isAssigningRole || isAssignScopeIncomplete}>
                   {isAssigningRole ? 'جارٍ الإسناد...' : 'إسناد الدور'}
                 </button>
               </div>

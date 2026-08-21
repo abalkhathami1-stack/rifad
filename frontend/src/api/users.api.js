@@ -127,35 +127,5 @@ export const UsersApi = {
       { method: 'DELETE' }
     );
     return res.data;
-  },
-
-  /**
-   * Frontend-safe helper (NOT a new endpoint): derives the schools the CALLER
-   * themself is scoped to, by reading their own record via the existing
-   * GET /api/v1/users/:id contract (self-view is always permitted — see
-   * UsersService.getUserById self-scope check on the Backend).
-   *
-   * There is no dedicated schools-listing endpoint in this Backend yet, so this
-   * is the only Frontend-safe way to obtain real school names for a school-scoped
-   * caller. It intentionally returns ONLY schools the caller already belongs to —
-   * it cannot and must not be used to browse all schools in the system. Platform-
-   * level callers (no schoolId in their own scope) will get an empty list; the UI
-   * must treat that as "school selection unavailable", never fall back to a
-   * hardcoded or invented school list.
-   *
-   * @param {string} callerUserId
-   * @returns {Promise<Array<{id: string, code: string, nameAr: string}>>}
-   */
-  async getMyScopedSchools(callerUserId) {
-    if (!callerUserId) return [];
-    const data = await this.getUser(callerUserId);
-    const assignments = data?.user?.roleAssignments || [];
-    const seen = new Map();
-    assignments.forEach((a) => {
-      if (a.school && a.school.id && !seen.has(a.school.id)) {
-        seen.set(a.school.id, a.school);
-      }
-    });
-    return Array.from(seen.values());
   }
 };
