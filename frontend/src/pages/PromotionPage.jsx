@@ -51,10 +51,10 @@ export function PromotionPage() {
   const fetchAcademicYears = async () => {
     try {
       const data = await AcademicApi.listYears();
-      if (data && data.years) {
-        setAcademicYears(data.years);
+      if (data && data.academicYears) {
+        setAcademicYears(data.academicYears);
         // Find current year as default source
-        const currentYear = data.years.find((y) => y.isCurrent);
+        const currentYear = data.academicYears.find((y) => y.isCurrent);
         if (currentYear) {
           setSourceYearId(currentYear.id);
         }

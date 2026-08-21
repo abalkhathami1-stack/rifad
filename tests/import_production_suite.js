@@ -303,7 +303,12 @@ async function runImportProductionTestSuite() {
       .post(`/api/v1/import/batches/${stuBatchId}/commit`)
       .set('Cookie', adminCookie);
 
-    assert(doubleCommitRes.status === 400, 'Double-commit rejected with 400 Bad Request');
+    // RIFAD-GAP-014 hardening: commitBatch now re-checks status under a row lock inside the
+    // transaction, so an already-COMMITTED batch is rejected via the same clean business-state
+    // error path (409 CONFLICT) as any other concurrent-loser attempt, not the generic 400 used
+    // before this fix.
+    assert(doubleCommitRes.status === 409, 'Double-commit rejected with 409 Conflict (RIFAD-GAP-014 business-state error semantics)');
+    assert(doubleCommitRes.body.error.code === 'CONFLICT', 'Double-commit error code is CONFLICT');
 
     // ----------------------------------------------------
     // TEST 10: Upload CSV File for Teachers with Sensitive PII
@@ -401,6 +406,102 @@ async function runImportProductionTestSuite() {
     assert(decryptedNationalId === '1098765432', 'National ID decrypted accurately with AES-256-GCM');
 
     // ----------------------------------------------------
+    // TEST 13c: RIFAD-GAP-014 — Concurrent commitBatch Race (Teacher Import Path)
+    // ----------------------------------------------------
+    console.log('\n--- 13c. RIFAD-GAP-014: Concurrent commitBatch Row-Lock Hardening (Teachers) ---');
+
+    const concTchBatchRes = await request(app)
+      .post('/api/v1/import/batches')
+      .set('Cookie', adminCookie)
+      .send({ entityType: 'TEACHERS', originalFileName: 'teachers_concurrency.csv' });
+    assert(concTchBatchRes.status === 201, 'GAP-014 setup: concurrency-test teacher batch created (201)');
+    const concTchBatchId = concTchBatchRes.body.data.batch.id;
+
+    const CONC_NATIONAL_ID = '1077777777';
+    const concTeacherData = [
+      {
+        'full_name_ar': 'سلطان محمد العنزي',
+        'employee_number': 'EMP-CONC-001',
+        'specialization': 'SPEC_MATH',
+        'national_id': CONC_NATIONAL_ID,
+        'phone': '0567777777',
+        'email': 'sultan.anzi@school.edu.sa'
+      }
+    ];
+    const concTeacherCsvBuffer = createCsvBuffer(concTeacherData);
+
+    const concUploadRes = await request(app)
+      .post(`/api/v1/import/batches/${concTchBatchId}/upload`)
+      .set('Cookie', adminCookie)
+      .attach('file', concTeacherCsvBuffer, 'teachers_concurrency.csv');
+    assert(concUploadRes.status === 200, 'GAP-014 setup: concurrency-test teacher CSV uploaded');
+
+    const concValidateRes = await request(app)
+      .post(`/api/v1/import/batches/${concTchBatchId}/validate`)
+      .set('Cookie', adminCookie);
+    assert(concValidateRes.status === 200 && concValidateRes.body.data.status === 'VALIDATED', 'GAP-014 setup: concurrency-test batch is VALIDATED with 0 errors');
+
+    // Two truly concurrent commit requests dispatched against the SAME VALIDATED batch
+    const [concCommit1, concCommit2] = await Promise.all([
+      request(app).post(`/api/v1/import/batches/${concTchBatchId}/commit`).set('Cookie', adminCookie),
+      request(app).post(`/api/v1/import/batches/${concTchBatchId}/commit`).set('Cookie', adminCookie)
+    ]);
+
+    // --- RIFAD-GAP-014 Diagnostic Instrumentation -----------------------------
+    // Safe, PII-free snapshot of BOTH concurrent responses, printed here (only
+    // around this assertion) so a failure below shows the ACTUAL status/error
+    // pair instead of forcing a guess. Only HTTP status, the application-level
+    // error code (a fixed enum from ERROR_CODES, never user data), and the
+    // static Arabic business message from AppError are logged — never cookies,
+    // tokens, PII, raw import data, encrypted values, hashes, or stack traces
+    // (the `details` field, which can carry `err.stack` for unhandled errors
+    // outside production, is intentionally never logged here).
+    const summarizeConcCommitResponse = (res) => ({
+      httpStatus: res.status,
+      appErrorCode: res.body && res.body.error ? res.body.error.code : null,
+      appErrorMessage: res.body && res.body.error ? res.body.error.message : null,
+      success: res.body ? res.body.success !== false : null
+    });
+    console.log('   [GAP-014 DIAGNOSTIC] concCommit1:', JSON.stringify(summarizeConcCommitResponse(concCommit1)));
+    console.log('   [GAP-014 DIAGNOSTIC] concCommit2:', JSON.stringify(summarizeConcCommitResponse(concCommit2)));
+
+    // NOTE: .sort((a, b) => a - b) is ascending, so for the two fixed HTTP status
+    // constants involved here (200 < 409) the smaller value always lands at index 0.
+    // The assertion below checks the statuses in that same ascending order (200 then
+    // 409) — matching the array it reads, not the order the two requests were fired in.
+    const concCommitStatuses = [concCommit1.status, concCommit2.status].sort((a, b) => a - b);
+    assert(concCommitStatuses[0] === 200 && concCommitStatuses[1] === 409, '1+2. Exactly ONE commit request succeeded (200) and exactly ONE was rejected (409)');
+
+    const concCommitWinner = concCommit1.status === 200 ? concCommit1 : concCommit2;
+    const concCommitLoser = concCommit1.status === 200 ? concCommit2 : concCommit1;
+
+    assert(concCommitWinner.body.data.status === 'COMMITTED', 'Winning commit request returned status COMMITTED');
+    assert(concCommitWinner.body.data.insertedCount === 1, 'Winning commit request inserted exactly 1 teacher record');
+    assert(concCommitLoser.body.error.code === 'CONFLICT', '7. Losing commit request received a clean business-state error (CONFLICT), not a raw DB error');
+    const concCommitLoserBodyText = JSON.stringify(concCommitLoser.body);
+    assert(!/prisma|postgres|P2002|P2025|constraint|duplicate key/i.test(concCommitLoserBodyText), '7. Losing response does not leak raw Prisma/Postgres error details');
+
+    // 3. Batch ends COMMITTED
+    const concTchBatchFinal = await prisma.importBatch.findUnique({ where: { id: concTchBatchId } });
+    assert(concTchBatchFinal.status === 'COMMITTED', '3. Final batch status in the database is COMMITTED');
+
+    // 4+5. Teacher operational row created exactly once — no duplicate Teacher from the race
+    const concTeachers = await prisma.teacher.findMany({
+      where: { schoolId: schoolA.id, employeeNumber: 'EMP-CONC-001' }
+    });
+    assert(concTeachers.length === 1, '4+5. Exactly ONE Teacher row was created despite two concurrent commit requests (no duplicate)');
+
+    // 8. Commit audit event occurs exactly once
+    const concCommitAuditLogs = await prisma.auditLog.findMany({
+      where: { entityId: concTchBatchId, eventType: 'IMPORT_BATCH_COMMITTED' }
+    });
+    assert(concCommitAuditLogs.length === 1, '8. Exactly ONE IMPORT_BATCH_COMMITTED audit event was created (no false success from the losing request)');
+
+    // 10. PII encryption remains intact for the record created by the winning request
+    assert(concTeachers[0].nationalIdEncrypted !== CONC_NATIONAL_ID, '10. National ID is not stored in plaintext (encryption intact)');
+    assert(decryptText(concTeachers[0].nationalIdEncrypted) === CONC_NATIONAL_ID, '10. National ID decrypts correctly with AES-256-GCM (encryption intact)');
+
+    // ----------------------------------------------------
     // TEST 11: Multi-Tenancy Scope Violation
     // ----------------------------------------------------
     console.log('\n--- 14. Multi-Tenancy Scope Violation (School A Admin -> School B) ---');
@@ -473,6 +574,17 @@ async function runImportProductionTestSuite() {
         await prisma.school.deleteMany({ where: { id: sid } });
       }
       await cleanupEphemeralPlatformOwner(prisma, ephemeralOwner);
+
+      const [remainingBatches, remainingTeachers, remainingSchools] = await Promise.all([
+        prisma.importBatch.count({ where: { schoolId: { in: createdSchoolIds } } }),
+        prisma.teacher.count({ where: { schoolId: { in: createdSchoolIds } } }),
+        prisma.school.count({ where: { id: { in: createdSchoolIds } } })
+      ]);
+      assert(
+        remainingBatches === 0 && remainingTeachers === 0 && remainingSchools === 0,
+        '12. Cleanup succeeded — no orphaned import batch/teacher/school test data remains (including the GAP-014 concurrency-test batch)'
+      );
+
       console.log('✨ Cleanup complete.');
     } catch (cleanupErr) {
       console.error('⚠️ Cleanup warning:', cleanupErr.message);

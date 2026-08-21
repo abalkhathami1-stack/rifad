@@ -518,42 +518,62 @@ class PromotionService {
     isPlatformLevel,
     context = {}
   }) {
-    const batch = await prisma.promotionBatch.findUnique({
-      where: { id: batchId },
-      include: {
-        items: {
-          include: {
-            student: true,
-            fromClassSection: true,
-            toClassSection: true
-          }
-        },
-        sourceAcademicYear: true,
-        targetAcademicYear: true
-      }
-    });
-
-    if (!batch) throw new AppError('دفعة الترفيع غير موجودة', 404, ERROR_CODES.NOT_FOUND);
-
-    AcademicService.resolveSchoolId({
-      callerScopes,
-      isPlatformLevel,
-      requestedSchoolId: batch.schoolId
-    });
-
-    if (batch.status !== 'UNDER_REVIEW') {
-      throw new AppError('يجب أن تكون الدفعة في حالة مراجعة (UNDER_REVIEW) قبل الاعتماد النهائي', 400, ERROR_CODES.BAD_REQUEST);
-    }
-
-    if (batch.items.length === 0) {
-      throw new AppError('لا يمكن اعتماد دفعة ترفيع لا تحتوي على أي قرارات طلاب', 400, ERROR_CODES.BAD_REQUEST);
-    }
-
-    const schoolId = batch.schoolId;
-
-    // Single Atomic Transaction for full batch rollover
+    // Single Atomic Transaction for the full batch rollover
     const approvedBatch = await prisma.$transaction(async (tx) => {
-      for (const item of batch.items) {
+      // RIFAD-GAP-013: PostgreSQL row-level lock on the targeted promotion batch, re-checked
+      // under lock, to prevent two concurrent approvals from both executing the promotion
+      // workflow. Mirrors the established pattern in commitStudentOnboardingBatch.
+      const lockedBatches = await tx.$queryRaw`
+        SELECT
+          id,
+          school_id AS "schoolId",
+          source_academic_year_id AS "sourceAcademicYearId",
+          target_academic_year_id AS "targetAcademicYearId",
+          status,
+          promoted_count AS "promotedCount",
+          retained_count AS "retainedCount",
+          graduated_count AS "graduatedCount"
+        FROM promotion_batches
+        WHERE id = ${batchId}::uuid
+        FOR UPDATE
+      `;
+
+      const lockedBatch = lockedBatches && lockedBatches.length > 0 ? lockedBatches[0] : null;
+
+      if (!lockedBatch) {
+        throw new AppError('دفعة الترفيع غير موجودة', 404, ERROR_CODES.NOT_FOUND);
+      }
+
+      const schoolId = AcademicService.resolveSchoolId({
+        callerScopes,
+        isPlatformLevel,
+        requestedSchoolId: lockedBatch.schoolId
+      });
+
+      if (lockedBatch.status !== 'UNDER_REVIEW') {
+        throw new AppError('يجب أن تكون الدفعة في حالة مراجعة (UNDER_REVIEW) قبل الاعتماد النهائي', 409, ERROR_CODES.CONFLICT);
+      }
+
+      // Re-load items inside the transaction, under lock — never trust a pre-transaction
+      // snapshot for the data actually being approved.
+      const items = await tx.promotionBatchItem.findMany({
+        where: { batchId },
+        include: {
+          student: true,
+          fromClassSection: true,
+          toClassSection: true
+        }
+      });
+
+      if (items.length === 0) {
+        throw new AppError('لا يمكن اعتماد دفعة ترفيع لا تحتوي على أي قرارات طلاب', 400, ERROR_CODES.BAD_REQUEST);
+      }
+
+      const targetAcademicYear = await tx.academicYear.findUnique({
+        where: { id: lockedBatch.targetAcademicYearId }
+      });
+
+      for (const item of items) {
         const studentId = item.studentId;
         const finalAction = item.finalAction;
 
@@ -567,7 +587,7 @@ class PromotionService {
           where: {
             schoolId,
             studentId,
-            academicYearId: batch.sourceAcademicYearId,
+            academicYearId: lockedBatch.sourceAcademicYearId,
             enrollmentStatus: 'ACTIVE',
             deletedAt: null
           },
@@ -594,7 +614,7 @@ class PromotionService {
             const existingTargetEnrollment = await tx.studentEnrollment.findFirst({
               where: {
                 studentId,
-                academicYearId: batch.targetAcademicYearId,
+                academicYearId: lockedBatch.targetAcademicYearId,
                 deletedAt: null
               }
             });
@@ -604,7 +624,7 @@ class PromotionService {
                 data: {
                   schoolId,
                   studentId,
-                  academicYearId: batch.targetAcademicYearId,
+                  academicYearId: lockedBatch.targetAcademicYearId,
                   classSectionId: item.toClassSectionId,
                   enrollmentStatus: 'ACTIVE',
                   enrollmentDate: new Date()
@@ -639,11 +659,11 @@ class PromotionService {
           entityId: batchId,
           action: 'UPDATE',
           newData: {
-            totalProcessed: batch.items.length,
-            promoted: batch.promotedCount,
-            retained: batch.retainedCount,
-            graduated: batch.graduatedCount,
-            targetYear: batch.targetAcademicYear.name
+            totalProcessed: items.length,
+            promoted: lockedBatch.promotedCount,
+            retained: lockedBatch.retainedCount,
+            graduated: lockedBatch.graduatedCount,
+            targetYear: targetAcademicYear ? targetAcademicYear.name : null
           },
           ipAddress: context.ipAddress || null,
           userAgent: context.userAgent || null
@@ -651,6 +671,17 @@ class PromotionService {
       });
 
       return res;
+    }, {
+      // RIFAD-GAP-013 (P2028 correction): approveBatch loops over every promotion item
+      // while holding the row lock, issuing multiple sequential writes per item — the
+      // same multi-step, per-record shape as commitStudentOnboardingBatch, which already
+      // required raising these limits above Prisma's defaults (maxWait 2000ms / timeout
+      // 5000ms) for exactly this reason. A real local run reproduced P2028 ("Transaction
+      // API error: ... old closed transaction") here under concurrent load. Mirrors the
+      // established, already-proven values from commitStudentOnboardingBatch verbatim —
+      // no new pattern introduced.
+      maxWait: 10000,
+      timeout: 60000
     });
 
     return approvedBatch;

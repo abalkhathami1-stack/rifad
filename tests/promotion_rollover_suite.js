@@ -338,6 +338,139 @@ async function runPromotionRolloverTestSuite() {
     assert(unauthorizedApproveRes.body.error.code === 'FORBIDDEN_INSUFFICIENT_PERMISSIONS', 'Returns FORBIDDEN_INSUFFICIENT_PERMISSIONS');
 
     // ----------------------------------------------------
+    // TEST: RIFAD-GAP-013 — Concurrent approveBatch Race
+    // ----------------------------------------------------
+    console.log('\n--- 12b. RIFAD-GAP-013: Concurrent approveBatch Row-Lock Hardening ---');
+
+    // Isolated fixtures for this batch — a fresh source/target year pair so this does not
+    // collide with the sequential batch/year pair used by the rest of this suite.
+    const sourceYearC = await prisma.academicYear.create({
+      data: {
+        schoolId: schoolA.id,
+        name: '2028-2029 (GAP-013)',
+        startDate: new Date('2028-08-20'),
+        endDate: new Date('2029-06-15'),
+        isCurrent: false
+      }
+    });
+    const targetYearC = await prisma.academicYear.create({
+      data: {
+        schoolId: schoolA.id,
+        name: '2029-2030 (GAP-013)',
+        startDate: new Date('2029-08-20'),
+        endDate: new Date('2030-06-15'),
+        isCurrent: false
+      }
+    });
+    const classSourceC = await prisma.classSection.create({
+      data: {
+        schoolId: schoolA.id,
+        academicYearId: sourceYearC.id,
+        gradeId: grade10.id,
+        sectionDivisionId: sectionA.id,
+        nameAr: 'شعبة اختبار التزامن'
+      }
+    });
+
+    const stuConc = await prisma.student.create({
+      data: {
+        schoolId: schoolA.id,
+        studentCode: `STU-CONC-${Date.now().toString().slice(-4)}`,
+        firstNameAr: 'فهد',
+        familyNameAr: 'الزهراني',
+        fullNameAr: 'فهد الزهراني',
+        status: 'ACTIVE'
+      }
+    });
+    createdStudentIds.push(stuConc.id);
+
+    await prisma.studentEnrollment.create({
+      data: { schoolId: schoolA.id, studentId: stuConc.id, academicYearId: sourceYearC.id, classSectionId: classSourceC.id, enrollmentStatus: 'ACTIVE' }
+    });
+
+    // 1. Batch prepared in valid pre-approval state (UNDER_REVIEW)
+    const concCreateRes = await request(app)
+      .post('/api/v1/promotion/batches')
+      .set('Cookie', acadCookie)
+      .send({ sourceAcademicYearId: sourceYearC.id, targetAcademicYearId: targetYearC.id, notes: 'دفعة اختبار التزامن' });
+    assert(concCreateRes.status === 201, 'GAP-013 setup: concurrency-test batch created (201)');
+    const concBatchId = concCreateRes.body.data.batch.id;
+
+    const concGenerateRes = await request(app)
+      .post(`/api/v1/promotion/batches/${concBatchId}/generate`)
+      .set('Cookie', acadCookie);
+    assert(concGenerateRes.status === 200, 'GAP-013 setup: items generated for concurrency-test batch');
+
+    const concReviewRes = await request(app)
+      .patch(`/api/v1/promotion/batches/${concBatchId}/status`)
+      .set('Cookie', acadCookie)
+      .send({ status: 'UNDER_REVIEW' });
+    assert(concReviewRes.status === 200 && concReviewRes.body.data.batch.status === 'UNDER_REVIEW', '1. Concurrency-test batch prepared in valid pre-approval state (UNDER_REVIEW)');
+
+    // 2. Two truly concurrent approval requests dispatched against the SAME batch
+    const [concRes1, concRes2] = await Promise.all([
+      request(app).post(`/api/v1/promotion/batches/${concBatchId}/approve`).set('Cookie', adminCookie),
+      request(app).post(`/api/v1/promotion/batches/${concBatchId}/approve`).set('Cookie', adminCookie)
+    ]);
+    assert(Boolean(concRes1) && Boolean(concRes2), '2. Two concurrent approval requests dispatched against the same batch');
+
+    // --- RIFAD-GAP-013 Diagnostic Instrumentation -----------------------------
+    // Safe, PII-free snapshot of BOTH concurrent responses, printed here (only
+    // around this assertion) so a failure below shows the ACTUAL status/error
+    // pair instead of forcing a guess. Only HTTP status, the application-level
+    // error code (a fixed enum from ERROR_CODES, never user data), and the
+    // static Arabic business message from AppError are logged — never cookies,
+    // tokens, PII, raw student data, encrypted values, hashes, or stack traces
+    // (the `details` field, which can carry `err.stack` for unhandled errors
+    // outside production, is intentionally never logged here).
+    const summarizeConcResponse = (res) => ({
+      httpStatus: res.status,
+      appErrorCode: res.body && res.body.error ? res.body.error.code : null,
+      appErrorMessage: res.body && res.body.error ? res.body.error.message : null,
+      success: res.body ? res.body.success !== false : null
+    });
+    console.log('   [GAP-013 DIAGNOSTIC] concRes1:', JSON.stringify(summarizeConcResponse(concRes1)));
+    console.log('   [GAP-013 DIAGNOSTIC] concRes2:', JSON.stringify(summarizeConcResponse(concRes2)));
+
+    // NOTE: .sort((a, b) => a - b) is ascending, so for the two fixed HTTP status
+    // constants involved here (200 < 409) the smaller value always lands at index 0.
+    // The assertion below checks the statuses in that same ascending order (200 then
+    // 409) — matching the array it reads, not the order the two requests were fired in.
+    const concStatuses = [concRes1.status, concRes2.status].sort((a, b) => a - b);
+    assert(concStatuses[0] === 200 && concStatuses[1] === 409, '3+4. Exactly ONE request succeeded (200) and exactly ONE was rejected (409) — no double-approval');
+
+    const concWinner = concRes1.status === 200 ? concRes1 : concRes2;
+    const concLoser = concRes1.status === 200 ? concRes2 : concRes1;
+
+    assert(concWinner.body.data.batch.status === 'APPROVED', 'Winning request returned status APPROVED');
+    assert(concLoser.body.error.code === 'CONFLICT', '7. Losing request received a clean business-state error (CONFLICT), not a raw DB error');
+    const concLoserBodyText = JSON.stringify(concLoser.body);
+    assert(!/prisma|postgres|P2002|P2025|constraint|duplicate key/i.test(concLoserBodyText), '8. Losing response does not leak raw Prisma/Postgres error details');
+
+    // 5. Final batch status is correct
+    const concBatchFinal = await prisma.promotionBatch.findUnique({ where: { id: concBatchId } });
+    assert(concBatchFinal.status === 'APPROVED', '5. Final batch status in the database is APPROVED');
+
+    // 6+7. Promotion effects occurred exactly once — no duplicate enrollment/side-effects
+    const concSourceEnrollment = await prisma.studentEnrollment.findFirst({
+      where: { studentId: stuConc.id, academicYearId: sourceYearC.id }
+    });
+    assert(concSourceEnrollment.enrollmentStatus === 'PROMOTED', '6. Source-year enrollment correctly transitioned exactly once (PROMOTED)');
+
+    // 9. Audit success event occurs exactly once
+    const concAuditLogs = await prisma.auditLog.findMany({
+      where: { entityId: concBatchId, eventType: 'PROMOTION_BATCH_APPROVED' }
+    });
+    assert(concAuditLogs.length === 1, '9. Exactly ONE PROMOTION_BATCH_APPROVED audit event was created (no false success from the losing request)');
+
+    // 11. Existing double-approve-after-completion guard still works (now via the same CONFLICT path)
+    const concThirdApproveRes = await request(app)
+      .post(`/api/v1/promotion/batches/${concBatchId}/approve`)
+      .set('Cookie', adminCookie);
+    assert(concThirdApproveRes.status === 409, '11. Re-approving an already-APPROVED batch is still rejected (409) — double-approve guard intact');
+    assert(concThirdApproveRes.body.error.code === 'CONFLICT', '11. Re-approval rejection uses the CONFLICT error code');
+
+    // ----------------------------------------------------
     // TEST: Approve Batch by SCHOOL_ADMIN
     // ----------------------------------------------------
     console.log('\n--- 13. Approve Promotion Batch by SCHOOL_ADMIN (Atomic Rollover) ---');
@@ -441,6 +574,18 @@ async function runPromotionRolloverTestSuite() {
         await prisma.school.deleteMany({ where: { id: sid } });
       }
       await cleanupEphemeralPlatformOwner(prisma, ephemeralOwner);
+
+      const [remainingBatches, remainingItems, remainingStudents, remainingSchools] = await Promise.all([
+        prisma.promotionBatch.count({ where: { schoolId: { in: createdSchoolIds } } }),
+        prisma.promotionBatchItem.count({ where: { batch: { schoolId: { in: createdSchoolIds } } } }),
+        prisma.student.count({ where: { schoolId: { in: createdSchoolIds } } }),
+        prisma.school.count({ where: { id: { in: createdSchoolIds } } })
+      ]);
+      assert(
+        remainingBatches === 0 && remainingItems === 0 && remainingStudents === 0 && remainingSchools === 0,
+        '12. Cleanup succeeded — no orphaned promotion batch/item/student/school test data remains (including the GAP-013 concurrency-test batch)'
+      );
+
       console.log('✨ Cleanup complete.');
     } catch (cleanupErr) {
       console.error('⚠️ Cleanup warning:', cleanupErr.message);

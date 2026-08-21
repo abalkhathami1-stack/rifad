@@ -638,40 +638,64 @@ class ImportService {
     isPlatformLevel,
     context = {}
   }) {
-    const batch = await prisma.importBatch.findUnique({
-      where: { id: batchId },
-      include: {
-        records: {
-          where: { status: 'VALID' },
-          orderBy: { rowNumber: 'asc' }
-        }
-      }
-    });
-
-    if (!batch) throw new AppError('دفعة الاستيراد غير موجودة', 404, ERROR_CODES.NOT_FOUND);
-
-    AcademicService.resolveSchoolId({
-      callerScopes,
-      isPlatformLevel,
-      requestedSchoolId: batch.schoolId
-    });
-
-    if (batch.status === 'COMMITTED') {
-      throw new AppError('تم اعتماد هذه الدفعة مسبقاً ولا يمكن إعادة إدخالها', 400, ERROR_CODES.BAD_REQUEST);
-    }
-
-    if (batch.status !== 'VALIDATED' || batch.errorRows > 0 || batch.records.length === 0) {
-      throw new AppError('لا يمكن اعتماد الدفعة إلا بعد فحصها واجتياز كافة السجلات بنجاح (VALIDATED مع صفر أخطاء)', 400, ERROR_CODES.BAD_REQUEST);
-    }
-
-    const schoolId = batch.schoolId;
-
-    // Load active academic year
-    const activeYear = await prisma.academicYear.findFirst({
-      where: { schoolId, isCurrent: true, deletedAt: null }
-    });
-
     const result = await prisma.$transaction(async (tx) => {
+      // RIFAD-GAP-014: PostgreSQL row-level lock on the targeted import batch, re-checked
+      // under lock, to prevent two concurrent commits from both passing a stale pre-transaction
+      // status check. Mirrors the established pattern in commitStudentOnboardingBatch.
+      const lockedBatches = await tx.$queryRaw`
+        SELECT
+          id,
+          school_id AS "schoolId",
+          status,
+          error_rows AS "errorRows",
+          valid_rows AS "validRows",
+          total_rows AS "totalRows",
+          entity_type AS "entityType"
+        FROM import_batches
+        WHERE id = ${batchId}::uuid
+        FOR UPDATE
+      `;
+
+      const batch = lockedBatches && lockedBatches.length > 0 ? lockedBatches[0] : null;
+
+      if (!batch) {
+        throw new AppError('دفعة الاستيراد غير موجودة', 404, ERROR_CODES.NOT_FOUND);
+      }
+
+      const schoolId = AcademicService.resolveSchoolId({
+        callerScopes,
+        isPlatformLevel,
+        requestedSchoolId: batch.schoolId
+      });
+
+      if (batch.status === 'COMMITTED') {
+        throw new AppError('تم اعتماد هذه الدفعة مسبقاً ولا يمكن إعادة إدخالها', 409, ERROR_CODES.CONFLICT);
+      }
+
+      if (batch.status !== 'VALIDATED') {
+        throw new AppError(`لا يمكن اعتماد الدفعة: حالة الدفعة الحالية هي ${batch.status} وليست VALIDATED`, 409, ERROR_CODES.CONFLICT);
+      }
+
+      if (batch.errorRows > 0) {
+        throw new AppError('لا يمكن اعتماد الدفعة إلا بعد فحصها واجتياز كافة السجلات بنجاح (VALIDATED مع صفر أخطاء)', 400, ERROR_CODES.BAD_REQUEST);
+      }
+
+      // Re-fetch VALID records inside the transaction, under lock — never trust a
+      // pre-transaction snapshot for the data actually being committed.
+      const records = await tx.importRecord.findMany({
+        where: { batchId, status: 'VALID' },
+        orderBy: { rowNumber: 'asc' }
+      });
+
+      if (records.length === 0) {
+        throw new AppError('لا يمكن اعتماد الدفعة: لا توجد سجلات صالحة للاعتماد في هذه الدفعة', 400, ERROR_CODES.BAD_REQUEST);
+      }
+
+      // Load active academic year (read-only lookup, not part of the commit-eligibility check)
+      const activeYear = await tx.academicYear.findFirst({
+        where: { schoolId, isCurrent: true, deletedAt: null }
+      });
+
       let insertedCount = 0;
 
       if (batch.entityType === 'STUDENTS') {
@@ -685,7 +709,7 @@ class ImportService {
           if (c.nameEn) classMap.set(c.nameEn.trim(), c);
         });
 
-        for (const record of batch.records) {
+        for (const record of records) {
           const data = record.rawData || {};
           
           let firstNameAr = data.first_name_ar || data.firstNameAr;
@@ -747,7 +771,7 @@ class ImportService {
           if (s.code) specMap.set(s.code.toUpperCase(), s);
         });
 
-        for (const record of batch.records) {
+        for (const record of records) {
           const data = record.rawData || {};
 
           let firstNameAr = data.first_name_ar || data.firstNameAr;
