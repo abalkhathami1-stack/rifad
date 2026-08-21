@@ -214,6 +214,139 @@ async function runTeachersTestSuite() {
     assert(Boolean(dbTeacher1.nationalIdHash), 'Blind-index hash still generated and stored (untouched)');
 
     // ----------------------------------------------------
+    // TEST: RIFAD-GAP-005 — createTeacher.initialSubjectIds Cross-School Integrity
+    // ----------------------------------------------------
+    console.log('\n--- 6c. RIFAD-GAP-005: createTeacher initialSubjectIds Same-School Validation ---');
+
+    // Cross-school target fixture: a real Subject that belongs to School B
+    const subjectB = await prisma.subject.create({
+      data: { schoolId: schoolB.id, code: 'CROSSB101', nameAr: 'مادة اختراق - مدرسة ب' }
+    });
+
+    // A: Valid flow — createTeacher in School A with initialSubjectIds all from School A
+    const validSubjectsEmpNum = `EMP-GAP005-A-${Date.now().toString().slice(-6)}`;
+    const validSubjectsTchRes = await request(app)
+      .post('/api/v1/teachers')
+      .set('Cookie', adminCookie)
+      .send({
+        specializationId: specId,
+        employeeNumber: validSubjectsEmpNum,
+        firstNameAr: 'خالد',
+        familyNameAr: 'العتيبي',
+        hireDate: '2026-08-01',
+        nationalId: '1020000001',
+        initialSubjectIds: [mathSubject.id, physicsSubject.id]
+      });
+    assert(validSubjectsTchRes.status === 201, 'A1: createTeacher with same-school initialSubjectIds succeeds (201)');
+    const teacherWithSubjects = validSubjectsTchRes.body.data.teacher;
+
+    const teacherWithSubjectsLinks = await prisma.teacherSubject.findMany({ where: { teacherId: teacherWithSubjects.id } });
+    assert(teacherWithSubjectsLinks.length === 2, 'A2: Both TeacherSubject relations were created correctly');
+    assert(
+      teacherWithSubjectsLinks.some(l => l.subjectId === mathSubject.id) && teacherWithSubjectsLinks.some(l => l.subjectId === physicsSubject.id),
+      'A2: TeacherSubject relations reference the correct School A subjects'
+    );
+
+    const teacherWithSubjectsDetailRes = await request(app)
+      .get(`/api/v1/teachers/${teacherWithSubjects.id}`)
+      .set('Cookie', adminCookie);
+    assert(teacherWithSubjectsDetailRes.status === 200, 'A3: getTeacherById succeeds for the new teacher');
+    const detailSubjectCodes = teacherWithSubjectsDetailRes.body.data.teacher.subjects.map(s => s.subject.code);
+    assert(detailSubjectCodes.includes('MATH101') && detailSubjectCodes.includes('PHYS101'), 'A3: Teacher details correctly display both linked subjects');
+
+    // B: Cross-school rejection — a single initialSubjectId from School B
+    const crossOnlyEmpNum = `EMP-GAP005-B-${Date.now().toString().slice(-6)}`;
+    const crossOnlyTchRes = await request(app)
+      .post('/api/v1/teachers')
+      .set('Cookie', adminCookie)
+      .send({
+        specializationId: specId,
+        employeeNumber: crossOnlyEmpNum,
+        firstNameAr: 'محاولة',
+        familyNameAr: 'اختراق',
+        hireDate: '2026-08-01',
+        nationalId: '1020000002',
+        initialSubjectIds: [subjectB.id]
+      });
+    assert(crossOnlyTchRes.status === 404, 'B1: createTeacher with a School B subject in initialSubjectIds rejected (404)');
+    assert(crossOnlyTchRes.body.error.code === 'NOT_FOUND', 'B1: Error code is NOT_FOUND');
+
+    const crossOnlyBodyText = JSON.stringify(crossOnlyTchRes.body);
+    assert(!crossOnlyBodyText.includes(subjectB.id), 'B2: Error response does not leak the School B subject ID');
+    assert(!crossOnlyBodyText.includes('مادة اختراق - مدرسة ب') && !crossOnlyBodyText.includes(schoolB.id), 'B2: Error response does not leak the School B subject name or School B ID');
+
+    const crossOnlyTeacherInDb = await prisma.teacher.findFirst({ where: { employeeNumber: crossOnlyEmpNum } });
+    assert(!crossOnlyTeacherInDb, 'B3: No Teacher was persisted for the rejected cross-school-only attempt');
+
+    const crossOnlyOrphanLinks = await prisma.teacherSubject.findMany({ where: { subjectId: subjectB.id } });
+    assert(crossOnlyOrphanLinks.length === 0, 'B4: No TeacherSubject referencing the School B subject was persisted');
+
+    // C: Mixed list atomicity — one valid School A subject + one School B subject
+    const tsCountBeforeMixed = await prisma.teacherSubject.count({ where: { schoolId: schoolA.id } });
+    const mixedEmpNum = `EMP-GAP005-C-${Date.now().toString().slice(-6)}`;
+    const mixedTchRes = await request(app)
+      .post('/api/v1/teachers')
+      .set('Cookie', adminCookie)
+      .send({
+        specializationId: specId,
+        employeeNumber: mixedEmpNum,
+        firstNameAr: 'قائمة',
+        familyNameAr: 'مختلطة',
+        hireDate: '2026-08-01',
+        nationalId: '1020000003',
+        initialSubjectIds: [mathSubject.id, subjectB.id]
+      });
+    assert(mixedTchRes.status === 404, 'C1: createTeacher with a mixed valid/cross-school initialSubjectIds list is rejected entirely (404)');
+    assert(mixedTchRes.body.error.code === 'NOT_FOUND', 'C1: Error code is NOT_FOUND');
+
+    const mixedTeacherInDb = await prisma.teacher.findFirst({ where: { employeeNumber: mixedEmpNum } });
+    assert(!mixedTeacherInDb, 'C2: No partial Teacher was persisted after the mixed-list rejection (full atomicity)');
+
+    const tsCountAfterMixed = await prisma.teacherSubject.count({ where: { schoolId: schoolA.id } });
+    assert(tsCountAfterMixed === tsCountBeforeMixed, 'C3: No partial TeacherSubject rows were persisted after the mixed-list rejection (full atomicity)');
+
+    // D: Regression
+    const noSubjectsEmpNum = `EMP-GAP005-D-${Date.now().toString().slice(-6)}`;
+    const noSubjectsTchRes = await request(app)
+      .post('/api/v1/teachers')
+      .set('Cookie', adminCookie)
+      .send({
+        specializationId: specId,
+        employeeNumber: noSubjectsEmpNum,
+        firstNameAr: 'بلا',
+        familyNameAr: 'مواد',
+        hireDate: '2026-08-01',
+        nationalId: '1020000004'
+      });
+    assert(noSubjectsTchRes.status === 201, 'D1: createTeacher without initialSubjectIds still works (201)');
+    const teacherNoSubjects = noSubjectsTchRes.body.data.teacher;
+
+    const noSubjectsBodyText = JSON.stringify(noSubjectsTchRes.body);
+    assert(!noSubjectsBodyText.includes('Encrypted') && !noSubjectsBodyText.includes('Hash'), 'D2: Create response body still contains no *Encrypted/*Hash keys (GAP-001/002 unaffected)');
+    assert(Boolean(teacherNoSubjects.nationalId) && teacherNoSubjects.nationalId.includes('*'), 'D2: nationalId still masked for SCHOOL_ADMIN (GAP-002 hardcoded bypass still removed)');
+    const dbTeacherNoSubjects = await prisma.teacher.findUnique({ where: { id: teacherNoSubjects.id } });
+    assert(decryptText(dbTeacherNoSubjects.nationalIdEncrypted) === '1020000004', 'D3: National ID encryption/decryption round-trip still correct (untouched by GAP-005)');
+
+    const regressionLinkRes = await request(app)
+      .post(`/api/v1/teachers/${teacherNoSubjects.id}/subjects`)
+      .set('Cookie', adminCookie)
+      .send({ subjectId: mathSubject.id });
+    assert(regressionLinkRes.status === 201, 'D4: assignTeacherSubject same-school still works (201)');
+
+    const regressionDuplicateRes = await request(app)
+      .post(`/api/v1/teachers/${teacherNoSubjects.id}/subjects`)
+      .set('Cookie', adminCookie)
+      .send({ subjectId: mathSubject.id });
+    assert(regressionDuplicateRes.status === 409, 'D5: assignTeacherSubject duplicate qualification behavior unchanged (409 Conflict)');
+
+    const regressionCrossAssignRes = await request(app)
+      .post(`/api/v1/teachers/${teacherNoSubjects.id}/subjects`)
+      .set('Cookie', adminCookie)
+      .send({ subjectId: subjectB.id });
+    assert(regressionCrossAssignRes.status === 404, 'D6: assignTeacherSubject cross-school subject still rejected (404) — pre-existing guard unchanged');
+    assert(regressionCrossAssignRes.body.error.code === 'NOT_FOUND', 'D6: Error code is NOT_FOUND');
+
+    // ----------------------------------------------------
     // TEST: Scope Guard - School Admin A cannot create in School B
     // ----------------------------------------------------
     console.log('\n--- 7. Multi-Tenancy Scope Violation (School A Admin -> School B) ---');
@@ -491,6 +624,18 @@ async function runTeachersTestSuite() {
         await prisma.school.deleteMany({ where: { id: sid } });
       }
       await cleanupEphemeralPlatformOwner(prisma, ephemeralOwner);
+
+      const [remainingTeachers, remainingTeacherSubjects, remainingSubjects, remainingSchools] = await Promise.all([
+        prisma.teacher.count({ where: { schoolId: { in: createdSchoolIds } } }),
+        prisma.teacherSubject.count({ where: { schoolId: { in: createdSchoolIds } } }),
+        prisma.subject.count({ where: { schoolId: { in: createdSchoolIds } } }),
+        prisma.school.count({ where: { id: { in: createdSchoolIds } } })
+      ]);
+      assert(
+        remainingTeachers === 0 && remainingTeacherSubjects === 0 && remainingSubjects === 0 && remainingSchools === 0,
+        'Cleanup succeeded — no orphaned School A/B teacher/subject test data remains (including the GAP-005 School B subject fixture)'
+      );
+
       console.log('✨ Cleanup complete.');
     } catch (cleanupErr) {
       console.error('⚠️ Cleanup warning:', cleanupErr.message);

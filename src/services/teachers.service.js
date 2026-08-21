@@ -311,6 +311,23 @@ class TeachersService {
       throw new AppError('رقم الهوية الوطنية مسجل مسبقاً في هذه المدرسة', 409, ERROR_CODES.CONFLICT);
     }
 
+    // RIFAD-GAP-005: verify every initial subject belongs to the same school as the teacher
+    // (mirrors assignTeacherSubject's same-school ownership check). Postgres FK constraints
+    // alone do not enforce same-school ownership. Deduped ONLY for this existence lookup —
+    // the create loop below still iterates the original initialSubjectIds unchanged, so any
+    // pre-existing duplicate-subject behavior (unique constraint on teacherId+subjectId) is
+    // preserved exactly as before.
+    const subjectIdsToValidate = Array.isArray(initialSubjectIds) ? [...new Set(initialSubjectIds)] : [];
+    if (subjectIdsToValidate.length > 0) {
+      const validSubjects = await prisma.subject.findMany({
+        where: { id: { in: subjectIdsToValidate }, schoolId, deletedAt: null },
+        select: { id: true }
+      });
+      if (validSubjects.length !== subjectIdsToValidate.length) {
+        throw new AppError('إحدى المواد الدراسية المحددة في initialSubjectIds غير موجودة في هذه المدرسة', 404, ERROR_CODES.NOT_FOUND);
+      }
+    }
+
     const fullNameAr = `${firstNameAr.trim()} ${familyNameAr.trim()}`;
     const nationalIdEncrypted = encryptText(nationalId.trim());
     const phoneEncrypted = phone ? encryptText(phone.trim()) : null;
