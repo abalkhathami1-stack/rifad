@@ -4,6 +4,8 @@ const { ERROR_CODES } = require('../constants/error-codes');
 const { encryptText, computeBlindHash } = require('../utils/crypto.util');
 const FileParserUtil = require('../utils/file-parser.util');
 const ArabicDataNormalizer = require('../import/normalizers/arabic-data.normalizer');
+const StudentValidator = require('../import/validators/student.validator');
+const SiblingDetector = require('../import/detectors/sibling.detector');
 const AcademicService = require('./academic.service');
 
 class ImportService {
@@ -337,6 +339,10 @@ class ImportService {
     const validRecordIds = [];
     const invalidRecordIds = [];
     const seenBatchCodes = new Set();
+    // RIFAD-GAP-011 Phase 0D.2: per-row guardian identity data captured during
+    // the main loop below, reused after it for the within-batch and
+    // existing-guardian consistency passes (STUDENTS only).
+    const studentGuardianRows = [];
 
     for (const record of batch.records) {
       const data = record.rawData || {};
@@ -429,6 +435,41 @@ class ImportService {
             seenBatchCodes.add(sCode);
           }
         }
+
+        // 5-8. Guardian Fields Check (RIFAD-GAP-011 Phase 0D.1)
+        // Single source of truth: StudentValidator.validateGuardianFields, the
+        // same guardian-rule implementation used by the (currently unreachable)
+        // OnboardingService pipeline and its direct unit tests. Normalized here
+        // via the same ArabicDataNormalizer.processRow already used later at
+        // commit time in commitStudentOnboardingBatch, so the value validate
+        // approves is semantically the value commit will actually consume.
+        // Approved product rules for this phase: parentId, parentName, and
+        // parentPhone are REQUIRED; parentEmail remains OPTIONAL (format-checked
+        // only when present). A row failing any of these can never reach VALID/
+        // VALIDATED status, so it can never reach commit.
+        const normalizedGuardian = ArabicDataNormalizer.processRow(data).parent;
+        const guardianErrors = StudentValidator.validateGuardianFields(normalizedGuardian, rowNumber);
+        guardianErrors.forEach(gErr => {
+          rowErrors.push({
+            batchId,
+            recordId: record.id,
+            rowNumber,
+            fieldName: gErr.fieldName,
+            errorCode: gErr.errorCode,
+            errorMessageAr: gErr.errorMessageAr
+          });
+        });
+
+        // Captured for the Phase 0D.2 consistency passes below. hasFieldError
+        // reflects every 0D.1 + 0D.2-field check above (name/grade/section/
+        // studentCode/guardian) so a row that already failed on its own merits
+        // can never spuriously trigger a false consistency mismatch.
+        studentGuardianRows.push({
+          recordId: record.id,
+          rowNumber,
+          parent: normalizedGuardian,
+          hasFieldError: rowErrors.length > 0
+        });
       } else if (batch.entityType === 'TEACHERS') {
         // 1. Name Check
         const hasArabicName = (data.firstNameAr && data.familyNameAr) ||
@@ -509,6 +550,117 @@ class ImportService {
         invalidRecordIds.push(record.id);
       } else {
         validRecordIds.push(record.id);
+      }
+    }
+
+    // RIFAD-GAP-011 Phase 0D.2: guardian identity consistency, STUDENTS only.
+    // Runs only against rows that already passed every 0D.1 field-level check
+    // (hasFieldError === false) — a row already invalid on its own fields is
+    // excluded so it cannot spuriously mismatch a legitimate sibling/guardian.
+    // Single shared comparator throughout: SiblingDetector.compareIdentities.
+    if (batch.entityType === 'STUDENTS') {
+      const moveToInvalid = (recordId, errorEntry) => {
+        errorsToInsert.push(errorEntry);
+        const idx = validRecordIds.indexOf(recordId);
+        if (idx !== -1) validRecordIds.splice(idx, 1);
+        if (!invalidRecordIds.includes(recordId)) invalidRecordIds.push(recordId);
+      };
+
+      const eligibleRows = studentGuardianRows.filter(r => !r.hasFieldError);
+
+      // A. Within-batch consistency — rows sharing the same normalized
+      // parentId must agree on normalized guardian name and phone. The first
+      // row encountered for a given parentId anchors the group's expected
+      // identity; every later row that disagrees is flagged (the anchor row
+      // itself is never flagged solely for being first).
+      const byParentId = new Map();
+      eligibleRows.forEach(r => {
+        const pid = r.parent.normalized.id;
+        if (!byParentId.has(pid)) byParentId.set(pid, []);
+        byParentId.get(pid).push(r);
+      });
+
+      const withinBatchMismatchIds = new Set();
+
+      for (const group of byParentId.values()) {
+        if (group.length < 2) continue;
+        const anchorIdentity = SiblingDetector.buildIdentityFromPlain(group[0].parent.raw.name, group[0].parent.normalized.phone);
+
+        for (let i = 1; i < group.length; i++) {
+          const row = group[i];
+          const rowIdentity = SiblingDetector.buildIdentityFromPlain(row.parent.raw.name, row.parent.normalized.phone);
+          const cmp = SiblingDetector.compareIdentities(rowIdentity, anchorIdentity);
+
+          if (!cmp.nameMatches) {
+            moveToInvalid(row.recordId, {
+              batchId,
+              recordId: row.recordId,
+              rowNumber: row.rowNumber,
+              fieldName: 'parentName',
+              errorCode: 'PARENT_NAME_MISMATCH',
+              errorMessageAr: `يوجد تعارض في اسم ولي الأمر مع صف آخر (صف ${group[0].rowNumber}) يحمل نفس رقم الهوية ضمن هذا الملف. يجب أن تتطابق بيانات ولي الأمر لجميع الإخوة`
+            });
+            withinBatchMismatchIds.add(row.recordId);
+          }
+          if (!cmp.phoneMatches) {
+            moveToInvalid(row.recordId, {
+              batchId,
+              recordId: row.recordId,
+              rowNumber: row.rowNumber,
+              fieldName: 'parentPhone',
+              errorCode: 'PARENT_PHONE_MISMATCH',
+              errorMessageAr: `يوجد تعارض في جوال ولي الأمر مع صف آخر (صف ${group[0].rowNumber}) يحمل نفس رقم الهوية ضمن هذا الملف. يجب أن تتطابق بيانات ولي الأمر لجميع الإخوة`
+            });
+            withinBatchMismatchIds.add(row.recordId);
+          }
+        }
+      }
+
+      // B. Existing-guardian consistency — a single batch-efficient lookup by
+      // the set of still-eligible rows' normalized-parentId blind hashes
+      // (avoids N+1 queries), compared via the same shared comparator. Never
+      // modifies the existing Guardian; never discloses its stored name/phone/
+      // hash in the error output.
+      const remainingEligible = eligibleRows.filter(r => !withinBatchMismatchIds.has(r.recordId));
+      const uniqueParentHashes = [...new Set(remainingEligible.map(r => computeBlindHash(r.parent.normalized.id)))];
+
+      if (uniqueParentHashes.length > 0) {
+        const existingGuardians = await prisma.guardian.findMany({
+          where: { schoolId, nationalIdHash: { in: uniqueParentHashes }, deletedAt: null },
+          select: { nationalIdHash: true, fullNameAr: true, phoneHash: true }
+        });
+        const guardianByHash = new Map(existingGuardians.map(g => [g.nationalIdHash, g]));
+
+        for (const row of remainingEligible) {
+          const parentHash = computeBlindHash(row.parent.normalized.id);
+          const existing = guardianByHash.get(parentHash);
+          if (!existing) continue;
+
+          const incomingIdentity = SiblingDetector.buildIdentityFromPlain(row.parent.raw.name, row.parent.normalized.phone);
+          const storedIdentity = SiblingDetector.buildIdentityFromStoredGuardian(existing);
+          const cmp = SiblingDetector.compareIdentities(incomingIdentity, storedIdentity);
+
+          if (!cmp.nameMatches) {
+            moveToInvalid(row.recordId, {
+              batchId,
+              recordId: row.recordId,
+              rowNumber: row.rowNumber,
+              fieldName: 'parentName',
+              errorCode: 'EXISTING_GUARDIAN_NAME_MISMATCH',
+              errorMessageAr: 'بيانات اسم ولي الأمر لا تطابق سجل ولي أمر موجود مسبقاً بنفس رقم الهوية. يرجى مراجعة وتصحيح بيانات الملف'
+            });
+          }
+          if (!cmp.phoneMatches) {
+            moveToInvalid(row.recordId, {
+              batchId,
+              recordId: row.recordId,
+              rowNumber: row.rowNumber,
+              fieldName: 'parentPhone',
+              errorCode: 'EXISTING_GUARDIAN_PHONE_MISMATCH',
+              errorMessageAr: 'بيانات جوال ولي الأمر لا تطابق سجل ولي أمر موجود مسبقاً بنفس رقم الهوية. يرجى مراجعة وتصحيح بيانات الملف'
+            });
+          }
+        }
       }
     }
 
@@ -1099,6 +1251,28 @@ class ImportService {
         let guardianId;
 
         if (existingGuardian) {
+          // RIFAD-GAP-011 Phase 0D.2: defense-in-depth guardian identity
+          // consistency re-check. validateBatch already proves this for a
+          // properly-validated batch (see the STUDENTS branch of
+          // ImportService.validateBatch), but the Guardian record can change
+          // between validate and commit, so it is re-verified here, under the
+          // same row lock, before ever reusing or reactivating an existing
+          // Guardian. Uses the SAME shared comparator as validateBatch — no
+          // second, independent comparison implementation.
+          const incomingIdentity = SiblingDetector.buildIdentityFromPlain(family.fullNameAr, family.phonePlain);
+          const storedIdentity = SiblingDetector.buildIdentityFromStoredGuardian(existingGuardian);
+          const identityCheck = SiblingDetector.compareIdentities(incomingIdentity, storedIdentity);
+
+          if (!identityCheck.isConsistent) {
+            // Clean business-state conflict — never a raw DB/500 error, and never
+            // the stored name/phone/hash disclosed in the error output.
+            throw new AppError(
+              'تعارض في بيانات هوية ولي الأمر: رقم الهوية المدخل يطابق سجل ولي أمر موجود مسبقاً ببيانات اسم أو جوال مختلفة. يجب مراجعة وتصحيح بيانات الملف قبل إعادة الاعتماد.',
+              409,
+              ERROR_CODES.CONFLICT
+            );
+          }
+
           guardianId = existingGuardian.id;
 
           if (existingGuardian.deletedAt) {

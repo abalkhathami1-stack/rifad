@@ -66,6 +66,28 @@ class StudentValidator {
       });
     }
 
+    // 4-7. Guardian Fields — delegated to validateGuardianFields(), the single
+    // source of truth for guardian rules (RIFAD-GAP-011 Phase 0D.1). Shared,
+    // unchanged in behavior/order, by both this legacy validateRow() caller and
+    // the live ImportService.validateBatch path.
+    errors.push(...this.validateGuardianFields(parent, rowNumber));
+
+    return errors;
+  }
+
+  /**
+   * Validates the guardian (parent) portion of a normalized row in isolation.
+   * SINGLE SOURCE OF TRUTH for guardian field rules (RIFAD-GAP-011 Phase 0D.1) —
+   * called both by validateRow() above and directly by the live
+   * ImportService.validateBatch STUDENTS path.
+   * @param {Object} parent - normalized parent object, i.e. the `.parent`
+   *   property of ArabicDataNormalizer.processRow(...)'s return value.
+   * @param {number} rowNumber - Excel/CSV row number, for error reporting.
+   * @returns {Array<Object>} guardian-only validation errors for this row.
+   */
+  static validateGuardianFields(parent, rowNumber) {
+    const errors = [];
+
     // 4. Parent ID Check
     if (!parent.raw.id) {
       errors.push({

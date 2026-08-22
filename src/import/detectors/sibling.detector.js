@@ -1,9 +1,64 @@
+const ArabicDataNormalizer = require('../normalizers/arabic-data.normalizer');
+const { computeBlindHash } = require('../../utils/crypto.util');
+
 /**
  * Sibling & Guardian Detector
  * Analyzes normalized records to cluster siblings by Parent ID, detects family groups,
  * and identifies discrepancies for the Review Queue without writing to operational tables.
+ *
+ * Also the SINGLE SOURCE OF TRUTH (RIFAD-GAP-011 Phase 0D.2) for guardian
+ * identity consistency comparisons — compareIdentities() below, plus its two
+ * adapter builders, are reused unchanged by the live
+ * ImportService.validateBatch (within-batch AND existing-guardian checks) and
+ * by ImportService.commitStudentOnboardingBatch's defense-in-depth re-check.
+ * Neither caller implements its own comparison logic.
  */
 class SiblingDetector {
+  /**
+   * Pure guardian-identity comparator. Name is compared as plaintext
+   * (Guardian.fullNameAr is stored unencrypted — no new name hash is
+   * introduced). Phone is compared strictly hash-to-hash via the existing
+   * blind-index utility — never decrypted for comparison.
+   * @param {{normalizedName: string, comparisonSignature: string, phoneHash: string}} a
+   * @param {{normalizedName: string, comparisonSignature: string, phoneHash: string}} b
+   * @returns {{nameMatches: boolean, phoneMatches: boolean, isConsistent: boolean}}
+   */
+  static compareIdentities(a, b) {
+    const nameMatches = Boolean(a.normalizedName) && Boolean(b.normalizedName) &&
+      (a.normalizedName === b.normalizedName || a.comparisonSignature === b.comparisonSignature);
+    const phoneMatches = Boolean(a.phoneHash) && Boolean(b.phoneHash) && a.phoneHash === b.phoneHash;
+    return { nameMatches, phoneMatches, isConsistent: nameMatches && phoneMatches };
+  }
+
+  /**
+   * Builds the comparable identity shape from plain (not-yet-hashed) row data —
+   * used for both an incoming import row and, at commit time, the already
+   * partly-normalized `family` object commitStudentOnboardingBatch builds.
+   * @param {string} name - guardian name, raw or already-normalized (idempotent either way)
+   * @param {string} normalizedPhone - already Saudi-phone-normalized value
+   */
+  static buildIdentityFromPlain(name, normalizedPhone) {
+    return {
+      normalizedName: ArabicDataNormalizer.normalizeArabicName(name),
+      comparisonSignature: ArabicDataNormalizer.generateNameComparisonSignature(name),
+      phoneHash: computeBlindHash(normalizedPhone)
+    };
+  }
+
+  /**
+   * Builds the comparable identity shape from a stored Guardian row. Reads
+   * only the plaintext name column and the existing phoneHash blind index —
+   * never decrypts phoneEncrypted/nationalIdEncrypted to compare.
+   * @param {{fullNameAr: string, phoneHash: string}} guardian
+   */
+  static buildIdentityFromStoredGuardian(guardian) {
+    return {
+      normalizedName: ArabicDataNormalizer.normalizeArabicName(guardian.fullNameAr),
+      comparisonSignature: ArabicDataNormalizer.generateNameComparisonSignature(guardian.fullNameAr),
+      phoneHash: guardian.phoneHash
+    };
+  }
+
   /**
    * Analyzes an array of normalized student+parent records and groups them by Parent ID.
    * @param {Array<Object>} records - array of { rowNumber, recordId, data: normalizedRowObj, isValid }

@@ -2,7 +2,8 @@ const request = require('supertest');
 const xlsx = require('xlsx');
 const app = require('../src/app');
 const prisma = require('../src/config/prisma');
-const { decryptText } = require('../src/utils/crypto.util');
+const { decryptText, computeBlindHash } = require('../src/utils/crypto.util');
+const ArabicDataNormalizer = require('../src/import/normalizers/arabic-data.normalizer');
 const {
   captureRealPlatformOwnerBaseline,
   createEphemeralPlatformOwner,
@@ -207,6 +208,11 @@ async function runImportProductionTestSuite() {
     // TEST 4: Upload Valid Excel File for Students
     // ----------------------------------------------------
     console.log('\n--- 7. Upload Valid Excel File for Students ---');
+    // RIFAD-GAP-011 Phase 0D.1: validateBatch now requires parentId/parentName/
+    // parentPhone for every STUDENTS row (parentEmail stays optional) — these
+    // fixtures gained valid guardian columns so this fixture keeps testing what
+    // it always tested (generic /commit flow, RBAC, double-commit guard) rather
+    // than being rejected by the new mandatory guardian-field rule.
     const validStudentData = [
       {
         'first_name_ar': 'عبدالرحمن',
@@ -215,7 +221,10 @@ async function runImportProductionTestSuite() {
         'family_name_ar': 'الغامدي',
         'grade': 'الصف الأول الابتدائي',
         'section': '1-أ',
-        'student_code': 'STU-PROD-001'
+        'student_code': 'STU-PROD-001',
+        'parent_id': '1011122001',
+        'parent_name': 'خالد عبدالعزيز الغامدي',
+        'parent_phone': '0511122001'
       },
       {
         'first_name_ar': 'عبدالله',
@@ -224,7 +233,10 @@ async function runImportProductionTestSuite() {
         'family_name_ar': 'الشهري',
         'grade': 'الصف الأول الابتدائي',
         'section': '1-أ',
-        'student_code': 'STU-PROD-002'
+        'student_code': 'STU-PROD-002',
+        'parent_id': '1011122002',
+        'parent_name': 'سعد علي الشهري',
+        'parent_phone': '0511122002'
       }
     ];
 
@@ -309,6 +321,383 @@ async function runImportProductionTestSuite() {
     // before this fix.
     assert(doubleCommitRes.status === 409, 'Double-commit rejected with 409 Conflict (RIFAD-GAP-014 business-state error semantics)');
     assert(doubleCommitRes.body.error.code === 'CONFLICT', 'Double-commit error code is CONFLICT');
+
+    // ----------------------------------------------------
+    // TEST 9b: RIFAD-GAP-011 Phase 0D.1 — Guardian Field Validation at Live Validate Gate
+    // ----------------------------------------------------
+    console.log('\n--- 12b. RIFAD-GAP-011 Phase 0D.1: Guardian Validation at validateBatch ---');
+
+    const gapBatchRes = await request(app)
+      .post('/api/v1/import/batches')
+      .set('Cookie', regCookie)
+      .send({ entityType: 'STUDENTS', originalFileName: 'guardian_validation_check.xlsx' });
+    assert(gapBatchRes.status === 201, 'GAP-011 setup: guardian-validation-check batch created (201)');
+    const gapBatchId = gapBatchRes.body.data.batch.id;
+
+    // 5 rows, each isolating exactly ONE deterministic guardian defect (A-E).
+    const gapInvalidRecords = [
+      { // A. Missing parentId
+        rowNumber: 1,
+        rawData: { firstNameAr: 'سالم', familyNameAr: 'العتيبي', grade: 'الصف الأول الابتدائي', section: '1-أ', parentName: 'فهد العتيبي', parentPhone: '0533344001' }
+      },
+      { // B. Invalid parentId format (not 10 digits)
+        rowNumber: 2,
+        rawData: { firstNameAr: 'نايف', familyNameAr: 'الحربي', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: '12345', parentName: 'سلطان الحربي', parentPhone: '0533344002' }
+      },
+      { // C. Missing parentName
+        rowNumber: 3,
+        rawData: { firstNameAr: 'تركي', familyNameAr: 'الدوسري', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: '1033344003', parentPhone: '0533344003' }
+      },
+      { // D. Missing parentPhone — must never reach the legacy 0500000000 placeholder path
+        rowNumber: 4,
+        rawData: { firstNameAr: 'بندر', familyNameAr: 'القحطاني', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: '1033344004', parentName: 'سعيد القحطاني' }
+      },
+      { // E. Invalid parentPhone format
+        rowNumber: 5,
+        rawData: { firstNameAr: 'ماجد', familyNameAr: 'الشمري', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: '1033344005', parentName: 'عبدالعزيز الشمري', parentPhone: '999' }
+      }
+    ];
+
+    const gapAddRes = await request(app)
+      .post(`/api/v1/import/batches/${gapBatchId}/records`)
+      .set('Cookie', regCookie)
+      .send({ records: gapInvalidRecords });
+    assert(gapAddRes.status === 201, 'GAP-011 setup: 5 guardian-defect rows staged');
+
+    const gapValidateRes = await request(app)
+      .post(`/api/v1/import/batches/${gapBatchId}/validate`)
+      .set('Cookie', regCookie);
+
+    assert(gapValidateRes.status === 200, 'A-E: Validation request completes (200 OK)');
+    assert(gapValidateRes.body.data.validRows === 0, 'A-E: Zero rows are VALID — every row has a deterministic guardian defect');
+    assert(gapValidateRes.body.data.errorRows === 5, 'A-E: All 5 rows are INVALID');
+    assert(gapValidateRes.body.data.status !== 'VALIDATED', 'A-E: Batch status is NOT VALIDATED — rejected before commit, not deferred to it');
+
+    const gapErrorsRes = await request(app)
+      .get(`/api/v1/import/batches/${gapBatchId}/errors`)
+      .set('Cookie', regCookie);
+    const gapErrorCodes = gapErrorsRes.body.data.errors.map(e => e.errorCode);
+
+    assert(gapErrorCodes.includes('MISSING_PARENT_ID'), 'A. Missing parentId rejected at validate with MISSING_PARENT_ID');
+    assert(gapErrorCodes.includes('INVALID_PARENT_ID_FORMAT'), 'B. Malformed parentId rejected at validate with INVALID_PARENT_ID_FORMAT (not deferred to commit)');
+    assert(gapErrorCodes.includes('MISSING_PARENT_NAME'), 'C. Missing parentName rejected at validate with MISSING_PARENT_NAME');
+    assert(gapErrorCodes.includes('MISSING_PARENT_PHONE'), 'D. Missing parentPhone rejected at validate with MISSING_PARENT_PHONE');
+    assert(gapErrorCodes.includes('INVALID_SAUDI_PHONE_FORMAT'), 'E. Malformed parentPhone rejected at validate with INVALID_SAUDI_PHONE_FORMAT');
+
+    // I. Commit eligibility — a batch with deterministic guardian errors must never
+    // become commit-eligible, and must never reach the onboarding commit orchestrator.
+    const gapPreviewRes = await request(app)
+      .get(`/api/v1/import/batches/${gapBatchId}/preview`)
+      .set('Cookie', regCookie);
+    assert(gapPreviewRes.body.data.isCommitEligible === false, 'I. Batch with guardian defects is NOT commit-eligible');
+
+    const gapCommitAttemptRes = await request(app)
+      .post(`/api/v1/import/batches/${gapBatchId}/commit-onboarding`)
+      .set('Cookie', adminCookie);
+    assert(gapCommitAttemptRes.status === 409, 'I. commit-onboarding on a non-VALIDATED batch is rejected (409) — deterministic guardian defects never reach the commit orchestrator');
+    assert(gapCommitAttemptRes.body.error.code === 'CONFLICT', 'I. Rejection uses the existing CONFLICT error code — no new status/error vocabulary introduced');
+
+    // D (continued). Since the batch never reached VALIDATED, no student/guardian was
+    // ever persisted for the missing-parentPhone row — the legacy 0500000000 fallback
+    // in commitStudentOnboardingBatch was never reached.
+    const gapNoGhostGuardian = await prisma.guardian.findFirst({
+      where: { schoolId: schoolA.id, phoneHash: computeBlindHash('0500000000') }
+    });
+    assert(gapNoGhostGuardian === null, 'D. No guardian was created with the legacy placeholder phone — the fallback path was never reached');
+
+    // F + H + G. A second batch: F (parentEmail absent — still optional), H (a
+    // normalization variant ArabicDataNormalizer.normalizeSaudiPhone already
+    // supports today — a 9-digit number with no leading 0, e.g. "512233010",
+    // normalizes to a valid Saudi number), and G (fully valid guardian fields
+    // continue to validate normally, confirming this is additive, not a regression).
+    const gapValidBatchRes = await request(app)
+      .post('/api/v1/import/batches')
+      .set('Cookie', regCookie)
+      .send({ entityType: 'STUDENTS', originalFileName: 'guardian_validation_valid.xlsx' });
+    const gapValidBatchId = gapValidBatchRes.body.data.batch.id;
+
+    const gapValidRecords = [
+      { // F. parentEmail omitted entirely — must remain optional, row still valid
+        rowNumber: 1,
+        rawData: { firstNameAr: 'يزيد', familyNameAr: 'المطيري', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: '1033355001', parentName: 'خالد المطيري', parentPhone: '0533355001' }
+      },
+      { // H. parentPhone as a 9-digit number without a leading 0 — a normalization
+        // variant ArabicDataNormalizer.normalizeSaudiPhone already accepts as valid.
+        rowNumber: 2,
+        rawData: { firstNameAr: 'رياض', familyNameAr: 'الغامدي', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: '1033355002', parentName: 'ماجد الغامدي', parentPhone: '533355002' }
+      }
+    ];
+
+    await request(app)
+      .post(`/api/v1/import/batches/${gapValidBatchId}/records`)
+      .set('Cookie', regCookie)
+      .send({ records: gapValidRecords });
+
+    const gapValidValidateRes = await request(app)
+      .post(`/api/v1/import/batches/${gapValidBatchId}/validate`)
+      .set('Cookie', regCookie);
+
+    assert(gapValidValidateRes.status === 200, 'F/G/H: Validation request completes (200 OK)');
+    assert(gapValidValidateRes.body.data.validRows === 2, 'F/G/H: Both rows are VALID — missing optional email and a supported phone-normalization variant do not block validation');
+    assert(gapValidValidateRes.body.data.errorRows === 0, 'F/G/H: Zero validation errors');
+    assert(gapValidValidateRes.body.data.status === 'VALIDATED', 'F/G/H: Batch reaches VALIDATED — the new guardian rule does not over-reject legitimate rows');
+
+    // ----------------------------------------------------
+    // TEST 9c: RIFAD-GAP-011 Phase 0D.2 — Guardian Identity Consistency
+    // ----------------------------------------------------
+    console.log('\n--- 12c. RIFAD-GAP-011 Phase 0D.2: Guardian Identity Consistency & Safe Reuse ---');
+
+    // --- Part 1 (Scenarios A, B, C, I, J): Within-batch consistency -------
+    // 7 rows in one batch:
+    //   Rows 1-2: same parentId, equivalent normalized name/phone forms
+    //             (legitimate siblings — A — and a normalization-equivalence
+    //             proof — I: one row uses 05xxxxxxxx, the other 9665xxxxxxxx,
+    //             and one name form omits the "بن" noise word).
+    //   Rows 3-4: same parentId, DIFFERENT name, same phone (B).
+    //   Rows 5-6: same parentId, same name, DIFFERENT phone (C).
+    //   Row 7:    unique parentId, missing parentPhone entirely — proves the
+    //             0D.1 field-level guardian check still runs unaffected
+    //             alongside the new 0D.2 consistency checks (J).
+    const consistencyBatchRes = await request(app)
+      .post('/api/v1/import/batches')
+      .set('Cookie', regCookie)
+      .send({ entityType: 'STUDENTS', originalFileName: 'guardian_consistency_within_batch.xlsx' });
+    assert(consistencyBatchRes.status === 201, 'Phase 0D.2 setup: within-batch consistency check batch created (201)');
+    const consistencyBatchId = consistencyBatchRes.body.data.batch.id;
+
+    const consistencyRecords = [
+      { // 1. Anchor of legitimate sibling group
+        rowNumber: 1,
+        rawData: { firstNameAr: 'فهد', familyNameAr: 'العتيبي', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: '1044455001', parentName: 'خالد بن سعود الفهد', parentPhone: '0512340001' }
+      },
+      { // 2. Sibling — name without "بن" noise word, phone in 9665xxxxxxxx form: both must still match (A + I)
+        rowNumber: 2,
+        rawData: { firstNameAr: 'نورة', familyNameAr: 'العتيبي', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: '1044455001', parentName: 'خالد سعود الفهد', parentPhone: '966512340001' }
+      },
+      { // 3. Anchor of name-mismatch group (never itself flagged)
+        rowNumber: 3,
+        rawData: { firstNameAr: 'سلطان', familyNameAr: 'الغامدي', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: '1044455002', parentName: 'سلطان الغامدي', parentPhone: '0512340002' }
+      },
+      { // 4. B. Different parent name, same phone -> PARENT_NAME_MISMATCH
+        rowNumber: 4,
+        rawData: { firstNameAr: 'ريم', familyNameAr: 'الغامدي', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: '1044455002', parentName: 'فيصل الغامدي', parentPhone: '0512340002' }
+      },
+      { // 5. Anchor of phone-mismatch group (never itself flagged)
+        rowNumber: 5,
+        rawData: { firstNameAr: 'عبدالمجيد', familyNameAr: 'الشريف', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: '1044455003', parentName: 'عبدالمجيد الشريف', parentPhone: '0512340003' }
+      },
+      { // 6. C. Same parent name, different phone -> PARENT_PHONE_MISMATCH
+        rowNumber: 6,
+        rawData: { firstNameAr: 'لمى', familyNameAr: 'الشريف', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: '1044455003', parentName: 'عبدالمجيد الشريف', parentPhone: '0555550003' }
+      },
+      { // 7. J. Missing parentPhone entirely — unrelated unique parentId; must still be
+        // caught by the 0D.1 field-level check regardless of 0D.2 running alongside it
+        rowNumber: 7,
+        rawData: { firstNameAr: 'ياسر', familyNameAr: 'القرني', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: '1044455004', parentName: 'ياسر القرني' }
+      }
+    ];
+
+    const consistencyAddRes = await request(app)
+      .post(`/api/v1/import/batches/${consistencyBatchId}/records`)
+      .set('Cookie', regCookie)
+      .send({ records: consistencyRecords });
+    assert(consistencyAddRes.status === 201, 'Phase 0D.2 setup: 7 within-batch consistency rows staged');
+
+    const consistencyValidateRes = await request(app)
+      .post(`/api/v1/import/batches/${consistencyBatchId}/validate`)
+      .set('Cookie', regCookie);
+
+    assert(consistencyValidateRes.status === 200, 'Within-batch: Validation request completes (200 OK)');
+    // Valid: row 1, row 2 (siblings), row 3 (mismatch-group anchor, never
+    // flagged itself), row 5 (mismatch-group anchor, never flagged itself) = 4.
+    // Invalid: row 4 (PARENT_NAME_MISMATCH), row 6 (PARENT_PHONE_MISMATCH),
+    // row 7 (MISSING_PARENT_PHONE, an unrelated 0D.1 field error) = 3.
+    assert(consistencyValidateRes.body.data.validRows === 4, 'A+I: Rows 1-2 (legitimate siblings, normalization-equivalent forms) plus anchor rows 3 and 5 remain VALID');
+    assert(consistencyValidateRes.body.data.errorRows === 3, 'B+C+J: Rows 4, 6, and 7 are INVALID (name mismatch, phone mismatch, and the unrelated 0D.1 field error)');
+    assert(consistencyValidateRes.body.data.status !== 'VALIDATED', 'Batch is NOT VALIDATED while any consistency/field conflict remains unresolved');
+
+    const consistencyErrorsRes = await request(app)
+      .get(`/api/v1/import/batches/${consistencyBatchId}/errors`)
+      .set('Cookie', regCookie);
+    const consistencyErrors = consistencyErrorsRes.body.data.errors;
+    const consistencyErrorsByRow = {};
+    consistencyErrors.forEach(e => {
+      if (!consistencyErrorsByRow[e.rowNumber]) consistencyErrorsByRow[e.rowNumber] = [];
+      consistencyErrorsByRow[e.rowNumber].push(e.errorCode);
+    });
+
+    assert(!consistencyErrorsByRow[1] && !consistencyErrorsByRow[2], 'A: Rows 1-2 (siblings) carry zero errors');
+    assert(!consistencyErrorsByRow[3], 'B: Anchor row 3 is never flagged solely for being first in its group');
+    assert(Boolean(consistencyErrorsByRow[4] && consistencyErrorsByRow[4].includes('PARENT_NAME_MISMATCH')), 'B: Row 4 flagged with PARENT_NAME_MISMATCH against its group anchor (row 3)');
+    assert(!(consistencyErrorsByRow[4] || []).includes('PARENT_PHONE_MISMATCH'), 'B: Row 4 phone matches its anchor — no false-positive PARENT_PHONE_MISMATCH');
+    assert(!consistencyErrorsByRow[5], 'C: Anchor row 5 is never flagged solely for being first in its group');
+    assert(Boolean(consistencyErrorsByRow[6] && consistencyErrorsByRow[6].includes('PARENT_PHONE_MISMATCH')), 'C: Row 6 flagged with PARENT_PHONE_MISMATCH against its group anchor (row 5)');
+    assert(!(consistencyErrorsByRow[6] || []).includes('PARENT_NAME_MISMATCH'), 'C: Row 6 name matches its anchor — no false-positive PARENT_NAME_MISMATCH');
+    assert(Boolean(consistencyErrorsByRow[7] && consistencyErrorsByRow[7].includes('MISSING_PARENT_PHONE')), 'J (0D.1 regression spot-check): Row 7 still rejected with MISSING_PARENT_PHONE — 0D.1 field rules unaffected by 0D.2');
+
+    // K (privacy spot-check): the raw parent names/phones/IDs involved in the
+    // mismatches must never appear anywhere in the errors response payload —
+    // only row numbers and conflict type codes are permitted.
+    const consistencyErrorsBodyText = JSON.stringify(consistencyErrorsRes.body);
+    assert(!consistencyErrorsBodyText.includes('1044455002') && !consistencyErrorsBodyText.includes('1044455003'), 'K: Errors response does not leak raw parentId values for the mismatched groups');
+    assert(!consistencyErrorsBodyText.includes('فيصل الغامدي') && !consistencyErrorsBodyText.includes('سلطان الغامدي'), 'K: Errors response does not leak the conflicting parent names themselves');
+    assert(!consistencyErrorsBodyText.includes('0555550003'), 'K: Errors response does not leak the conflicting phone number itself');
+
+    // --- Part 2 (Scenarios D, E, F): Existing-Guardian consistency ---------
+    // A real Guardian is first created end-to-end via the live commit path,
+    // then three further batches target the SAME parentId: a legitimate
+    // reuse (D), a name mismatch (E), and a phone mismatch (F).
+    const EXISTING_PARENT_ID = '1044466001';
+    const EXISTING_PARENT_NAME = 'ناصر بن تركي السبيعي';
+    const EXISTING_PARENT_PHONE = '0522210001';
+
+    const setupBatchRes = await request(app)
+      .post('/api/v1/import/batches')
+      .set('Cookie', regCookie)
+      .send({ entityType: 'STUDENTS', originalFileName: 'guardian_consistency_setup.xlsx' });
+    const setupBatchId = setupBatchRes.body.data.batch.id;
+    await request(app)
+      .post(`/api/v1/import/batches/${setupBatchId}/records`)
+      .set('Cookie', regCookie)
+      .send({
+        records: [{
+          rowNumber: 1,
+          rawData: { firstNameAr: 'تركي', familyNameAr: 'السبيعي', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: EXISTING_PARENT_ID, parentName: EXISTING_PARENT_NAME, parentPhone: EXISTING_PARENT_PHONE }
+        }]
+      });
+    const setupValidateRes = await request(app)
+      .post(`/api/v1/import/batches/${setupBatchId}/validate`)
+      .set('Cookie', regCookie);
+    assert(setupValidateRes.body.data.status === 'VALIDATED', 'Phase 0D.2 setup: existing-Guardian source batch is VALIDATED');
+    const setupCommitRes = await request(app)
+      .post(`/api/v1/import/batches/${setupBatchId}/commit-onboarding`)
+      .set('Cookie', adminCookie);
+    assert(setupCommitRes.status === 200 && setupCommitRes.body.data.status === 'COMMITTED', 'Phase 0D.2 setup: existing-Guardian source batch committed — real Guardian now exists in DB');
+
+    // D. Legitimate reuse — equivalent normalized name/phone forms, end-to-end through commit
+    const reuseBatchRes = await request(app)
+      .post('/api/v1/import/batches')
+      .set('Cookie', regCookie)
+      .send({ entityType: 'STUDENTS', originalFileName: 'guardian_consistency_reuse.xlsx' });
+    const reuseBatchId = reuseBatchRes.body.data.batch.id;
+    await request(app)
+      .post(`/api/v1/import/batches/${reuseBatchId}/records`)
+      .set('Cookie', regCookie)
+      .send({
+        records: [{
+          rowNumber: 1,
+          rawData: { firstNameAr: 'سلمى', familyNameAr: 'السبيعي', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: EXISTING_PARENT_ID, parentName: 'ناصر تركي السبيعي', parentPhone: '966522210001' }
+        }]
+      });
+    const reuseValidateRes = await request(app)
+      .post(`/api/v1/import/batches/${reuseBatchId}/validate`)
+      .set('Cookie', regCookie);
+    assert(reuseValidateRes.body.data.validRows === 1 && reuseValidateRes.body.data.errorRows === 0, 'D: Legitimate reuse row (equivalent name/phone forms) passes existing-Guardian consistency at validate');
+    assert(reuseValidateRes.body.data.status === 'VALIDATED', 'D: Batch reaches VALIDATED');
+
+    const reusePreviewRes = await request(app)
+      .get(`/api/v1/import/batches/${reuseBatchId}/preview`)
+      .set('Cookie', regCookie);
+    assert(reusePreviewRes.body.data.isCommitEligible === true, 'D: Batch is commit-eligible');
+
+    const reuseCommitRes = await request(app)
+      .post(`/api/v1/import/batches/${reuseBatchId}/commit-onboarding`)
+      .set('Cookie', adminCookie);
+    assert(reuseCommitRes.status === 200 && reuseCommitRes.body.data.status === 'COMMITTED', 'D: Legitimate reuse batch committed successfully end-to-end');
+    assert(reuseCommitRes.body.data.summary.existingGuardiansReusedCount === 1, 'D: Existing Guardian was reused (not recreated) at commit');
+
+    const guardiansAfterReuse = await prisma.guardian.count({
+      where: { schoolId: schoolA.id, nationalIdHash: computeBlindHash(EXISTING_PARENT_ID) }
+    });
+    assert(guardiansAfterReuse === 1, 'D: Exactly ONE Guardian row exists for this parentId after the reuse commit — no duplicate created');
+
+    // E. Existing-guardian NAME mismatch — rejected at validate, never commit-eligible
+    const nameMismatchBatchRes = await request(app)
+      .post('/api/v1/import/batches')
+      .set('Cookie', regCookie)
+      .send({ entityType: 'STUDENTS', originalFileName: 'guardian_consistency_name_mismatch.xlsx' });
+    const nameMismatchBatchId = nameMismatchBatchRes.body.data.batch.id;
+    await request(app)
+      .post(`/api/v1/import/batches/${nameMismatchBatchId}/records`)
+      .set('Cookie', regCookie)
+      .send({
+        records: [{
+          rowNumber: 1,
+          rawData: { firstNameAr: 'بدر', familyNameAr: 'الدوسري', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: EXISTING_PARENT_ID, parentName: 'سالم الدوسري', parentPhone: EXISTING_PARENT_PHONE }
+        }]
+      });
+    const nameMismatchValidateRes = await request(app)
+      .post(`/api/v1/import/batches/${nameMismatchBatchId}/validate`)
+      .set('Cookie', regCookie);
+    assert(nameMismatchValidateRes.body.data.errorRows === 1, 'E: Existing-Guardian name-mismatch row is INVALID');
+    assert(nameMismatchValidateRes.body.data.status !== 'VALIDATED', 'E: Batch does not reach VALIDATED');
+
+    const nameMismatchErrorsRes = await request(app)
+      .get(`/api/v1/import/batches/${nameMismatchBatchId}/errors`)
+      .set('Cookie', regCookie);
+    const nameMismatchErrorCodes = nameMismatchErrorsRes.body.data.errors.map(e => e.errorCode);
+    assert(nameMismatchErrorCodes.includes('EXISTING_GUARDIAN_NAME_MISMATCH'), 'E: Error code EXISTING_GUARDIAN_NAME_MISMATCH returned');
+    assert(!nameMismatchErrorCodes.includes('EXISTING_GUARDIAN_PHONE_MISMATCH'), 'E: Phone matches the existing Guardian — no false-positive EXISTING_GUARDIAN_PHONE_MISMATCH');
+
+    const nameMismatchErrorsBodyText = JSON.stringify(nameMismatchErrorsRes.body);
+    assert(!nameMismatchErrorsBodyText.includes(EXISTING_PARENT_ID), 'K: Existing-Guardian mismatch errors do not leak the raw parentId');
+    assert(!nameMismatchErrorsBodyText.includes(EXISTING_PARENT_NAME) && !nameMismatchErrorsBodyText.includes('سالم الدوسري'), 'K: Existing-Guardian mismatch errors do not leak either guardian name');
+
+    const nameMismatchPreviewRes = await request(app)
+      .get(`/api/v1/import/batches/${nameMismatchBatchId}/preview`)
+      .set('Cookie', regCookie);
+    assert(nameMismatchPreviewRes.body.data.isCommitEligible === false, 'E: Batch is NOT commit-eligible');
+
+    const nameMismatchCommitAttemptRes = await request(app)
+      .post(`/api/v1/import/batches/${nameMismatchBatchId}/commit-onboarding`)
+      .set('Cookie', adminCookie);
+    assert(nameMismatchCommitAttemptRes.status === 409, 'E: commit-onboarding on the non-VALIDATED batch is rejected (409) — never reaches the commit orchestrator');
+
+    // F. Existing-guardian PHONE mismatch — rejected at validate, never commit-eligible
+    const phoneMismatchBatchRes = await request(app)
+      .post('/api/v1/import/batches')
+      .set('Cookie', regCookie)
+      .send({ entityType: 'STUDENTS', originalFileName: 'guardian_consistency_phone_mismatch.xlsx' });
+    const phoneMismatchBatchId = phoneMismatchBatchRes.body.data.batch.id;
+    await request(app)
+      .post(`/api/v1/import/batches/${phoneMismatchBatchId}/records`)
+      .set('Cookie', regCookie)
+      .send({
+        records: [{
+          rowNumber: 1,
+          rawData: { firstNameAr: 'هند', familyNameAr: 'السبيعي', grade: 'الصف الأول الابتدائي', section: '1-أ', parentId: EXISTING_PARENT_ID, parentName: EXISTING_PARENT_NAME, parentPhone: '0599990001' }
+        }]
+      });
+    const phoneMismatchValidateRes = await request(app)
+      .post(`/api/v1/import/batches/${phoneMismatchBatchId}/validate`)
+      .set('Cookie', regCookie);
+    assert(phoneMismatchValidateRes.body.data.errorRows === 1, 'F: Existing-Guardian phone-mismatch row is INVALID');
+    assert(phoneMismatchValidateRes.body.data.status !== 'VALIDATED', 'F: Batch does not reach VALIDATED');
+
+    const phoneMismatchErrorsRes = await request(app)
+      .get(`/api/v1/import/batches/${phoneMismatchBatchId}/errors`)
+      .set('Cookie', regCookie);
+    const phoneMismatchErrorCodes = phoneMismatchErrorsRes.body.data.errors.map(e => e.errorCode);
+    assert(phoneMismatchErrorCodes.includes('EXISTING_GUARDIAN_PHONE_MISMATCH'), 'F: Error code EXISTING_GUARDIAN_PHONE_MISMATCH returned');
+    assert(!phoneMismatchErrorCodes.includes('EXISTING_GUARDIAN_NAME_MISMATCH'), 'F: Name matches the existing Guardian — no false-positive EXISTING_GUARDIAN_NAME_MISMATCH');
+
+    const phoneMismatchErrorsBodyText = JSON.stringify(phoneMismatchErrorsRes.body);
+    assert(!phoneMismatchErrorsBodyText.includes('0599990001') && !phoneMismatchErrorsBodyText.includes(EXISTING_PARENT_PHONE), 'K: Existing-Guardian mismatch errors do not leak either phone number');
+
+    const phoneMismatchPreviewRes = await request(app)
+      .get(`/api/v1/import/batches/${phoneMismatchBatchId}/preview`)
+      .set('Cookie', regCookie);
+    assert(phoneMismatchPreviewRes.body.data.isCommitEligible === false, 'F: Batch is NOT commit-eligible');
+
+    // Final integrity check: despite 2 rejected mismatch attempts, still exactly
+    // ONE Guardian exists for this parentId — no Guardian was ever created,
+    // overwritten, or duplicated by any of the E/F rejected batches.
+    const guardiansAfterMismatches = await prisma.guardian.count({
+      where: { schoolId: schoolA.id, nationalIdHash: computeBlindHash(EXISTING_PARENT_ID) }
+    });
+    assert(guardiansAfterMismatches === 1, 'E+F: Still exactly ONE Guardian exists after both rejected mismatch attempts — no mutation, no duplicate');
+    const guardianStillOriginal = await prisma.guardian.findFirst({ where: { schoolId: schoolA.id, nationalIdHash: computeBlindHash(EXISTING_PARENT_ID) } });
+    assert(guardianStillOriginal.fullNameAr === ArabicDataNormalizer.normalizeArabicName(EXISTING_PARENT_NAME), 'E+F: The one surviving Guardian record still holds its original name — never overwritten by a rejected mismatch attempt');
 
     // ----------------------------------------------------
     // TEST 10: Upload CSV File for Teachers with Sensitive PII
@@ -553,6 +942,13 @@ async function runImportProductionTestSuite() {
       await prisma.importError.deleteMany({ where: { batch: { schoolId: { in: createdSchoolIds } } } });
       await prisma.importRecord.deleteMany({ where: { batch: { schoolId: { in: createdSchoolIds } } } });
       await prisma.importBatch.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
+      // RIFAD-GAP-011 Phase 0D.2: the new existing-Guardian consistency tests
+      // (D/E/F) commit real Guardian/StudentGuardian rows end-to-end via the
+      // live API, unlike Phase 0D.1's tests which never advanced past a
+      // rejected validate. Both must be deleted before Student (StudentGuardian
+      // -> Student and -> Guardian are onDelete: Restrict in the schema).
+      await prisma.studentGuardian.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
+      await prisma.guardian.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
       await prisma.studentEnrollment.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
       await prisma.student.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
       await prisma.teacher.deleteMany({ where: { schoolId: { in: createdSchoolIds } } });
@@ -575,14 +971,20 @@ async function runImportProductionTestSuite() {
       }
       await cleanupEphemeralPlatformOwner(prisma, ephemeralOwner);
 
-      const [remainingBatches, remainingTeachers, remainingSchools] = await Promise.all([
+      const [remainingBatches, remainingTeachers, remainingSchools, remainingGuardians, remainingStudentGuardians] = await Promise.all([
         prisma.importBatch.count({ where: { schoolId: { in: createdSchoolIds } } }),
         prisma.teacher.count({ where: { schoolId: { in: createdSchoolIds } } }),
-        prisma.school.count({ where: { id: { in: createdSchoolIds } } })
+        prisma.school.count({ where: { id: { in: createdSchoolIds } } }),
+        prisma.guardian.count({ where: { schoolId: { in: createdSchoolIds } } }),
+        prisma.studentGuardian.count({ where: { schoolId: { in: createdSchoolIds } } })
       ]);
       assert(
         remainingBatches === 0 && remainingTeachers === 0 && remainingSchools === 0,
         '12. Cleanup succeeded — no orphaned import batch/teacher/school test data remains (including the GAP-014 concurrency-test batch)'
+      );
+      assert(
+        remainingGuardians === 0 && remainingStudentGuardians === 0,
+        'L (Phase 0D.2 cleanup): No orphaned Guardian or StudentGuardian test data remains from the existing-Guardian consistency tests'
       );
 
       console.log('✨ Cleanup complete.');

@@ -172,6 +172,11 @@ async function runImportEngineTestSuite() {
     // TEST: Add Raw Records to Batch
     // ----------------------------------------------------
     console.log('\n--- 7. Add Staged Raw Records (POST /batches/:id/records) ---');
+    // RIFAD-GAP-011 Phase 0D.1: validateBatch now requires parentId/parentName/
+    // parentPhone for every STUDENTS row — Row 1 gained valid guardian fields so
+    // it remains the sole VALID row this test expects, still isolating exactly
+    // the student-field defects (Row 2 missing name, Row 3 duplicate code /
+    // invalid grade) this test was written to exercise.
     const rawStudentRecords = [
       {
         rowNumber: 1,
@@ -180,7 +185,10 @@ async function runImportEngineTestSuite() {
           familyNameAr: 'المنصور',
           studentCode: 'STU-IMP-001',
           grade: 'الصف الأول الثانوي',
-          classSection: 'شعبة 10-أ'
+          classSection: 'شعبة 10-أ',
+          parentId: '1022233001',
+          parentName: 'منصور سعيد المنصور',
+          parentPhone: '0522233001'
         }
       },
       {
