@@ -111,6 +111,60 @@ class RBACService {
 
     return true;
   }
+
+  /**
+   * RIFAD-GAP-017 Phase 0E.1 — Section-Scope Access Helper.
+   *
+   * Cross-cutting RBAC concern: computes a caller's effective SECTION-level
+   * access for a given school, expressed as either "unrestricted" (sees every
+   * section in the school — PLATFORM caller, or a SCHOOL-scoped assignment
+   * for this exact school) or a specific, possibly multi-valued, set of
+   * allowed sectionDivisionIds (one or more SECTION-scoped assignments for
+   * this school).
+   *
+   * This intentionally does NOT reimplement section-matching: the
+   * "unrestricted" branch reads the same PLATFORM/SCHOOL precedence
+   * validateScopeAccess already applies, and every individual SECTION
+   * candidate's accept/reject decision is delegated straight to
+   * validateScopeAccess itself (see below) — there is exactly one
+   * authoritative algorithm for "is this section allowed", reused here.
+   * A second, independent primitive exists only because list-style callers
+   * (Prisma `where` filters) need an allowed-ID *set* up front, which a
+   * single-target yes/no check cannot produce on its own — an "unrestricted"
+   * SCHOOL/PLATFORM caller must see sections with zero UserRoleAssignment
+   * pointing at them at all, so the allowed set cannot be derived purely by
+   * filtering the caller's own SECTION-type assignments.
+   *
+   * Callers needing a single object-level yes/no check (update/delete/create
+   * of one specific resource) should call RBACService.validateScopeAccess
+   * directly instead of this helper.
+   */
+  static resolveSectionScope(scopes, schoolId) {
+    const scopeList = Array.isArray(scopes) ? scopes : [];
+
+    const isUnrestricted =
+      scopeList.some(s => s.scopeType === 'PLATFORM') ||
+      scopeList.some(s => s.scopeType === 'SCHOOL' && s.schoolId === schoolId);
+
+    if (isUnrestricted) {
+      return { unrestricted: true, allowedSectionIds: [] };
+    }
+
+    const candidateSectionIds = [...new Set(
+      scopeList
+        .filter(s => s.scopeType === 'SECTION' && s.schoolId === schoolId && s.sectionDivisionId)
+        .map(s => s.sectionDivisionId)
+    )];
+
+    // Delegate the actual per-candidate accept/reject decision to
+    // validateScopeAccess — this loop only supplies candidate IDs to check,
+    // it does not decide anything about section matching itself.
+    const allowedSectionIds = candidateSectionIds.filter(sectionId =>
+      this.validateScopeAccess(scopeList, { targetSchoolId: schoolId, targetSectionDivisionId: sectionId })
+    );
+
+    return { unrestricted: false, allowedSectionIds };
+  }
 }
 
 module.exports = RBACService;

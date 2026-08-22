@@ -1,6 +1,7 @@
 const prisma = require('../config/prisma');
 const AppError = require('../utils/app-error.util');
 const { ERROR_CODES } = require('../constants/error-codes');
+const RBACService = require('./rbac.service');
 
 class AcademicService {
   /**
@@ -31,14 +32,43 @@ class AcademicService {
   // ==========================================
   static async listSections({ callerScopes, isPlatformLevel, schoolId }) {
     const targetSchoolId = this.resolveSchoolId({ callerScopes, isPlatformLevel, requestedSchoolId: schoolId });
+
+    // RIFAD-GAP-017 Phase 0E.1: SECTION-scoped callers may only see the
+    // SchoolSection(s) they are explicitly assigned to. SCHOOL/PLATFORM
+    // callers keep seeing every section in the school (unchanged). Filtering
+    // is computed server-side from callerScopes only — never from a client
+    // query param, since none is accepted by this endpoint.
+    const sectionScope = isPlatformLevel
+      ? { unrestricted: true, allowedSectionIds: [] }
+      : RBACService.resolveSectionScope(callerScopes, targetSchoolId);
+
+    const where = { schoolId: targetSchoolId, deletedAt: null };
+    if (!sectionScope.unrestricted) {
+      where.id = { in: sectionScope.allowedSectionIds };
+    }
+
     return await prisma.schoolSection.findMany({
-      where: { schoolId: targetSchoolId, deletedAt: null },
+      where,
       orderBy: { createdAt: 'asc' }
     });
   }
 
   static async createSection({ callerUser, callerScopes, isPlatformLevel, data, context = {} }) {
     const schoolId = this.resolveSchoolId({ callerScopes, isPlatformLevel, requestedSchoolId: data.schoolId });
+
+    // RIFAD-GAP-017 Phase 0E.1: creating a brand-new SchoolSection changes the
+    // school's own section structure — inherently school-level administration,
+    // not something a SECTION-scoped caller may do merely because the new
+    // section would belong to the same school they are assigned a slice of.
+    // Reuses the existing FORBIDDEN_SCOPE_VIOLATION vocabulary; no new
+    // permission code introduced.
+    if (!isPlatformLevel) {
+      const hasSchoolWideAccess = callerScopes.some(s => s.scopeType === 'SCHOOL' && s.schoolId === schoolId);
+      if (!hasSchoolWideAccess) {
+        throw new AppError('لا يمكن لمستخدم بنطاق قسم (SECTION) إنشاء قسم تعليمي جديد، فهذا إجراء على مستوى إدارة المدرسة', 403, ERROR_CODES.FORBIDDEN_SCOPE_VIOLATION);
+      }
+    }
+
     const { genderType, nameAr, nameEn } = data;
 
     if (!genderType || !nameAr) {
@@ -75,6 +105,15 @@ class AcademicService {
     if (!section) throw new AppError('القسم التعليمي غير موجود', 404, ERROR_CODES.NOT_FOUND);
     this.resolveSchoolId({ callerScopes, isPlatformLevel, requestedSchoolId: section.schoolId });
 
+    // RIFAD-GAP-017 Phase 0E.1: object-level SECTION enforcement — a SECTION-
+    // scoped caller may only modify the specific SchoolSection(s) they are
+    // assigned to, never a sibling section in the same school. Uses the same
+    // NOT_FOUND, non-disclosing pattern as a truly nonexistent section above,
+    // so an out-of-scope section's existence is never revealed.
+    if (!isPlatformLevel && !RBACService.validateScopeAccess(callerScopes, { targetSchoolId: section.schoolId, targetSectionDivisionId: section.id })) {
+      throw new AppError('القسم التعليمي غير موجود', 404, ERROR_CODES.NOT_FOUND);
+    }
+
     const updateData = {};
     if (data.nameAr !== undefined) updateData.nameAr = data.nameAr.trim();
     if (data.nameEn !== undefined) updateData.nameEn = data.nameEn ? data.nameEn.trim() : null;
@@ -107,6 +146,12 @@ class AcademicService {
     const section = await prisma.schoolSection.findFirst({ where: { id, deletedAt: null } });
     if (!section) throw new AppError('القسم التعليمي غير موجود', 404, ERROR_CODES.NOT_FOUND);
     this.resolveSchoolId({ callerScopes, isPlatformLevel, requestedSchoolId: section.schoolId });
+
+    // RIFAD-GAP-017 Phase 0E.1: object-level SECTION enforcement, same
+    // non-disclosing NOT_FOUND pattern as updateSection above.
+    if (!isPlatformLevel && !RBACService.validateScopeAccess(callerScopes, { targetSchoolId: section.schoolId, targetSectionDivisionId: section.id })) {
+      throw new AppError('القسم التعليمي غير موجود', 404, ERROR_CODES.NOT_FOUND);
+    }
 
     // Prevent deletion if connected to class sections
     const activeClasses = await prisma.classSection.count({ where: { sectionDivisionId: id, deletedAt: null } });
@@ -659,7 +704,25 @@ class AcademicService {
     const where = { schoolId: targetSchoolId, deletedAt: null };
     if (academicYearId) where.academicYearId = academicYearId;
     if (gradeId) where.gradeId = gradeId;
-    if (sectionDivisionId) where.sectionDivisionId = sectionDivisionId;
+
+    // RIFAD-GAP-017 Phase 0E.1: SECTION-scoped callers are automatically
+    // constrained to ClassSections under their own SchoolSection(s). A
+    // client-supplied sectionDivisionId query filter can only NARROW an
+    // already-allowed set — it can never widen scope, so an out-of-scope
+    // sectionDivisionId simply yields zero results rather than an error or a
+    // leak of which sections exist.
+    const sectionScope = isPlatformLevel
+      ? { unrestricted: true, allowedSectionIds: [] }
+      : RBACService.resolveSectionScope(callerScopes, targetSchoolId);
+
+    if (!sectionScope.unrestricted) {
+      const effectiveAllowed = sectionDivisionId
+        ? sectionScope.allowedSectionIds.filter(sid => sid === sectionDivisionId)
+        : sectionScope.allowedSectionIds;
+      where.sectionDivisionId = { in: effectiveAllowed };
+    } else if (sectionDivisionId) {
+      where.sectionDivisionId = sectionDivisionId;
+    }
 
     return await prisma.classSection.findMany({
       where,
@@ -691,6 +754,15 @@ class AcademicService {
       if (!academicYear) throw new AppError('السنة الدراسية المحددة غير موجودة في هذه المدرسة', 404, ERROR_CODES.NOT_FOUND);
       if (!grade) throw new AppError('الصف الدراسي المحدد غير موجود في هذه المدرسة', 404, ERROR_CODES.NOT_FOUND);
       if (!sectionDivision) throw new AppError('القسم المحدد غير موجود في هذه المدرسة', 404, ERROR_CODES.NOT_FOUND);
+
+      // RIFAD-GAP-017 Phase 0E.1: a SECTION-scoped caller may create a
+      // ClassSection only under a SchoolSection they are assigned to. Reuses
+      // the identical NOT_FOUND message/code as the same-school check
+      // immediately above, so a same-school-but-out-of-scope section cannot
+      // be distinguished from one that does not belong to this school at all.
+      if (!isPlatformLevel && !RBACService.validateScopeAccess(callerScopes, { targetSchoolId: schoolId, targetSectionDivisionId: sectionDivisionId })) {
+        throw new AppError('القسم المحدد غير موجود في هذه المدرسة', 404, ERROR_CODES.NOT_FOUND);
+      }
 
       const created = await tx.classSection.create({
         data: {
@@ -730,6 +802,13 @@ class AcademicService {
     if (!classSection) throw new AppError('الشعبة الصفية غير موجودة', 404, ERROR_CODES.NOT_FOUND);
     this.resolveSchoolId({ callerScopes, isPlatformLevel, requestedSchoolId: classSection.schoolId });
 
+    // RIFAD-GAP-017 Phase 0E.1: object-level SECTION enforcement — a SECTION-
+    // scoped caller may only modify a ClassSection under a SchoolSection they
+    // are assigned to. Same non-disclosing NOT_FOUND pattern used throughout.
+    if (!isPlatformLevel && !RBACService.validateScopeAccess(callerScopes, { targetSchoolId: classSection.schoolId, targetSectionDivisionId: classSection.sectionDivisionId })) {
+      throw new AppError('الشعبة الصفية غير موجودة', 404, ERROR_CODES.NOT_FOUND);
+    }
+
     const updateData = {};
     if (data.nameAr !== undefined) updateData.nameAr = data.nameAr.trim();
     if (data.nameEn !== undefined) updateData.nameEn = data.nameEn ? data.nameEn.trim() : null;
@@ -747,6 +826,16 @@ class AcademicService {
       if (updateData.sectionDivisionId !== undefined) {
         const sectionDivision = await tx.schoolSection.findFirst({ where: { id: updateData.sectionDivisionId, schoolId: classSection.schoolId, deletedAt: null } });
         if (!sectionDivision) throw new AppError('القسم المحدد غير موجود في هذه المدرسة', 404, ERROR_CODES.NOT_FOUND);
+
+        // RIFAD-GAP-017 Phase 0E.1: a SECTION-scoped caller may not move a
+        // ClassSection into a *different* SchoolSection than the one(s) they
+        // are assigned to, even one confirmed to belong to the same school.
+        // Identical NOT_FOUND message/code as the same-school check directly
+        // above, so the response cannot distinguish "cross-school" from
+        // "same-school, out-of-scope".
+        if (!isPlatformLevel && !RBACService.validateScopeAccess(callerScopes, { targetSchoolId: classSection.schoolId, targetSectionDivisionId: updateData.sectionDivisionId })) {
+          throw new AppError('القسم المحدد غير موجود في هذه المدرسة', 404, ERROR_CODES.NOT_FOUND);
+        }
       }
 
       const res = await tx.classSection.update({ where: { id }, data: updateData });
@@ -775,6 +864,12 @@ class AcademicService {
     const classSection = await prisma.classSection.findFirst({ where: { id, deletedAt: null } });
     if (!classSection) throw new AppError('الشعبة الصفية غير موجودة', 404, ERROR_CODES.NOT_FOUND);
     this.resolveSchoolId({ callerScopes, isPlatformLevel, requestedSchoolId: classSection.schoolId });
+
+    // RIFAD-GAP-017 Phase 0E.1: object-level SECTION enforcement, same
+    // non-disclosing NOT_FOUND pattern as updateClassSection above.
+    if (!isPlatformLevel && !RBACService.validateScopeAccess(callerScopes, { targetSchoolId: classSection.schoolId, targetSectionDivisionId: classSection.sectionDivisionId })) {
+      throw new AppError('الشعبة الصفية غير موجودة', 404, ERROR_CODES.NOT_FOUND);
+    }
 
     // Check active enrollments or assignments
     const activeEnrollments = await prisma.studentEnrollment.count({ where: { classSectionId: id, deletedAt: null } });
